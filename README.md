@@ -19,10 +19,36 @@ wts rm <name>...                           # forget workspace(s) + delete folder
    - Errors if that destination already exists and is non-empty.
    - Passes `-r REV` through to `jj workspace add` so the new working copy sits
      on top of that revision.
-4. `cd`s into the new workspace.
+4. Copies the untracked files listed in `wts.copy` (see below) from the source
+   workspace into the new one.
+5. `cd`s into the new workspace.
 
 Example: from `~/Documents/dev/sail`, `wts -n hotfix` creates and enters
 `~/Documents/dev/sail-wts/hotfix`.
+
+## Copying untracked files
+
+jj carries your **tracked** files into a new workspace, but ignored/untracked
+ones (`AGENTS.override.md`, `.env`, local tool config) stay behind. Declare glob
+patterns in the `wts.copy` jj config **table** and `wts` re-materializes the
+matching files from the source workspace into the new one. Each entry key is
+just a label; the string value is the glob:
+
+```fish
+jj config set --user wts.copy.agents AGENTS.override.md   # applies everywhere
+jj config set --user wts.copy.env '.env*'
+jj config set --repo wts.copy.local CLAUDE.local.md       # adds to the above in this repo
+```
+
+- A **table** (not an array) is required on purpose: jj *merges* config tables
+  across layers, so a `--repo` entry **extends** your `--user` set rather than
+  replacing it. (jj replaces arrays wholesale, which is why they aren't used.)
+- Patterns are globs (`*`, `**`, `?`, `[...]`) resolved relative to the source
+  workspace root; matched directories are copied recursively.
+- Unset by default: nothing is copied unless you opt in. Missing matches are
+  skipped silently; a copy error is a warning, never fatal.
+- Inspect the rules in force for a repo with `jj config get wts.copy`, or
+  `jj config list wts.copy` to see each entry.
 
 ## Install
 

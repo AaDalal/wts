@@ -80,6 +80,85 @@ fn sanitize(s: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// Copy the files matched by the `wts.copy` jj config setting from the source
+/// workspace into the freshly-created one. These are the untracked/ignored files
+/// (e.g. `AGENTS.override.md`, `.env`) that jj does not carry into a new
+/// workspace on its own. Unset config copies nothing; missing matches are
+/// skipped silently — a copy failure is a warning, never fatal.
+fn copy_configured_files(source: &Path, dest: &Path) {
+    let patterns = copy_patterns();
+    let base = glob::Pattern::escape(&source.to_string_lossy());
+    let mut copied = 0usize;
+    for pat in &patterns {
+        let entries = match glob::glob(&format!("{base}/{pat}")) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("wts: ignoring bad wts.copy pattern '{pat}': {e}");
+                continue;
+            }
+        };
+        for path in entries.flatten() {
+            let Ok(rel) = path.strip_prefix(source) else { continue };
+            match copy_path(&path, &dest.join(rel)) {
+                Ok(n) => copied += n,
+                Err(e) => eprintln!("wts: failed to copy {}: {e}", rel.display()),
+            }
+        }
+    }
+    if copied > 0 {
+        eprintln!("wts: copied {copied} file(s) into the new workspace");
+    }
+}
+
+/// Glob patterns to copy, read from the `wts.copy` jj config table
+/// (`wts.copy.<label> = "<glob>"`). A table is required because jj *merges*
+/// tables across config layers, so a per-repo entry extends the user-level set
+/// rather than replacing it. Entry keys are just labels; the string values are
+/// the globs. Unset (or any non-table value) yields none. `jj config list`
+/// prints valid TOML, so we parse it directly.
+fn copy_patterns() -> Vec<String> {
+    let listing = jj_capture(&["config", "list", "wts.copy"]).unwrap_or_default();
+    if listing.is_empty() {
+        return vec![];
+    }
+    let table: toml::Table = match listing.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("wts: ignoring unparseable wts.copy config: {e}");
+            return vec![];
+        }
+    };
+    match table.get("wts").and_then(|w| w.get("copy")) {
+        Some(toml::Value::Table(t)) => {
+            // Sorted for a deterministic copy order regardless of layer/merge.
+            let mut pats: Vec<String> =
+                t.values().filter_map(|v| v.as_str().map(str::to_string)).collect();
+            pats.sort();
+            pats
+        }
+        _ => vec![],
+    }
+}
+
+/// Recursively copy a file or directory, creating parent dirs as needed, and
+/// return the number of files written.
+fn copy_path(src: &Path, dst: &Path) -> std::io::Result<usize> {
+    if fs::symlink_metadata(src)?.is_dir() {
+        fs::create_dir_all(dst)?;
+        let mut n = 0;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            n += copy_path(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        return Ok(n);
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(src, dst)?;
+    Ok(1)
+}
+
 /// The jj repo root of the current workspace.
 fn workspace_root() -> PathBuf {
     PathBuf::from(
@@ -185,6 +264,10 @@ fn do_create(revision: Option<String>, name: Option<String>) {
     if !status.success() {
         die("jj workspace add failed");
     }
+
+    // Carry over untracked files (AGENTS.override.md, .env, …) that jj doesn't
+    // bring into a new workspace itself; opt-in via the `wts.copy` jj config.
+    copy_configured_files(&root, &dest);
 
     // Emit the path for the shell wrapper to cd into.
     println!("{}", dest.display());

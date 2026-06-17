@@ -10,6 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+glob = "0.3"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 
 [profile.release]
 opt-level = "z"
