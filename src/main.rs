@@ -489,6 +489,14 @@ fn do_rm(names: Vec<String>) {
         .collect();
 
     for (name, dir) in &targets {
+        // `default` is jj's main workspace (the repo itself), not a wts-managed
+        // sibling — refuse it so `wts rm default` can't detach the main repo.
+        if name == "default" {
+            eprintln!("wts: refusing to remove the 'default' (main) workspace");
+            failed = true;
+            continue;
+        }
+
         let in_jj = known.contains(&name.as_str());
         let on_disk = dir.exists();
 
