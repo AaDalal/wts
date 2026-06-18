@@ -1,11 +1,18 @@
 //! wts — create or remove jj workspaces in a sibling `<repo>-wts/` folder.
 //!
-//! With no subcommand it creates a workspace and prints its absolute path as the
-//! ONLY stdout line; `wts rm <name>...` forgets workspaces and deletes their
-//! folders. All human-facing messages go to stderr. The `wts` shell function
-//! captures stdout and `cd`s into it — for create that's the new workspace, and
-//! for `rm` it's the main repo when you just deleted the folder you were in (a
-//! child process cannot change the parent shell's directory itself).
+//! With no subcommand it creates a workspace; `wts rm <name>...` forgets
+//! workspaces and deletes their folders. Human-facing messages go to stderr.
+//!
+//! A child process cannot change the parent shell's directory, so when wts wants
+//! the shell to cd somewhere it writes the target path to the file named by the
+//! `WTS_CD_FILE` env var (set by the `wts` shell function), which then cd's
+//! there — into the new workspace on create, or back to the main repo after `rm`
+//! deletes the folder you were standing in. Run without `WTS_CD_FILE` (e.g. a
+//! direct `cargo run`) there's no shell to cd, so the path just appears on
+//! stderr with the rest of the diagnostics.
+//!
+//! The default "cd into the new workspace" step can be replaced per-repo by a
+//! `wts.action` jj config pointing at an executable script (see `run_action`).
 
 use std::env;
 use std::ffi::OsStr;
@@ -47,6 +54,56 @@ enum Cmd {
 fn die(msg: impl AsRef<str>) -> ! {
     eprintln!("wts: error: {}", msg.as_ref());
     exit(1);
+}
+
+/// Tell the shell wrapper where to cd by writing the path to the scratch file it
+/// names in `WTS_CD_FILE`. With no `WTS_CD_FILE` (e.g. a direct `cargo run`,
+/// outside the wrapper) there's nothing to cd, so this is a no-op — the path is
+/// already on stderr via the "creating workspace …" message.
+fn emit_cd(path: &Path) {
+    let Some(file) = env::var_os("WTS_CD_FILE") else { return };
+    if let Err(e) = fs::write(&file, format!("{}\n", path.display())) {
+        eprintln!("wts: could not record cd target: {e}");
+    }
+}
+
+/// Path to the configured `wts.action` script, if any. A leading `~/` expands to
+/// `$HOME`; an unset or empty value yields `None`.
+fn action_script() -> Option<String> {
+    match jj_capture(&["config", "get", "wts.action"]) {
+        Ok(s) if !s.trim().is_empty() => Some(expand_tilde(s.trim())),
+        _ => None,
+    }
+}
+
+fn expand_tilde(s: &str) -> String {
+    match s.strip_prefix("~/") {
+        Some(rest) => match env::var("HOME") {
+            Ok(home) => format!("{home}/{rest}"),
+            Err(_) => s.to_string(),
+        },
+        None => s.to_string(),
+    }
+}
+
+/// Run the configured `wts.action` in place of the default cd. The script
+/// carries its own shebang (fish, bash, python, rust-script, …) and is run with
+/// the new workspace as both its working directory and its sole argument, and
+/// with that path also exported as `$WTS_DIR`. Stdio is inherited so interactive
+/// actions (opening an editor, starting a shell) work. The action's exit code
+/// becomes ours — the workspace was already created, so this only reports how
+/// the action itself fared.
+fn run_action(script: &str, dest: &Path) {
+    eprintln!("wts: running wts.action ({script})");
+    let status = Command::new(script)
+        .arg(dest)
+        .env("WTS_DIR", dest)
+        .current_dir(dest)
+        .status()
+        .unwrap_or_else(|e| die(format!("failed to run wts.action '{script}': {e}")));
+    if !status.success() {
+        exit(status.code().unwrap_or(1));
+    }
 }
 
 /// Run a jj command and return trimmed stdout, or the trimmed stderr as Err.
@@ -269,8 +326,12 @@ fn do_create(revision: Option<String>, name: Option<String>) {
     // bring into a new workspace itself; opt-in via the `wts.copy` jj config.
     copy_configured_files(&root, &dest);
 
-    // Emit the path for the shell wrapper to cd into.
-    println!("{}", dest.display());
+    // Default action is to cd into the new workspace; a `wts.action` script
+    // replaces that and is handed the new directory instead.
+    match action_script() {
+        Some(script) => run_action(&script, &dest),
+        None => emit_cd(&dest),
+    }
 }
 
 fn do_rm(names: Vec<String>) {
@@ -347,7 +408,7 @@ fn do_rm(names: Vec<String>) {
     // If we deleted the folder the shell was sitting in, tell the wrapper to cd
     // back to the main repo so it doesn't strand the shell in a ghost dir.
     if cwd_removed {
-        println!("{}", main_repo.display());
+        emit_cd(&main_repo);
     }
     if failed {
         exit(1);
