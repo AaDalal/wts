@@ -1,7 +1,10 @@
-//! wts: create or remove jj workspaces in a sibling `<repo>-wts/` folder.
+//! wts: create or remove workspaces in a sibling `<repo>-wts/` folder.
 //!
-//! With no subcommand it creates a workspace; `wts rm <name>...` forgets
-//! workspaces and deletes their folders. Human-facing messages go to stderr.
+//! wts works on top of either [jujutsu](https://jj-vcs.github.io/jj/) (a jj
+//! workspace) or plain [git](https://git-scm.com/) (a git worktree); it detects
+//! which at startup (see [`detect_backend`]). With no subcommand it creates a
+//! workspace; `wts rm <name>...` removes workspaces and deletes their folders.
+//! Human-facing messages go to stderr.
 //!
 //! A child process cannot change the parent shell's directory, so when wts wants
 //! the shell to cd somewhere it writes the target path to the file named by the
@@ -14,6 +17,7 @@
 //! What a new workspace does once created is its **action**: `-a NAME`, else
 //! the action named `default`. Actions are configured under `wts.action.<name>`
 //! (a script path, or the literal `cd` for the built-in cd; see `resolve_action`).
+//! Config lives in jj config (TOML) or git config (INI) depending on the backend.
 
 use std::env;
 use std::ffi::OsStr;
@@ -23,21 +27,31 @@ use std::process::{exit, Command};
 
 use clap::{Parser, Subcommand};
 
+/// Which VCS backs the current repo. Selected once per run by [`detect_backend`]
+/// and threaded through the create/remove logic; jj and git differ in how
+/// workspaces are created, named, listed, and configured.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Jj,
+    Git,
+}
+
 #[derive(Parser)]
 #[command(
     name = "wts",
-    about = "Create (or remove) a jj workspace in a sibling <repo>-wts/ folder"
+    about = "Create (or remove) a jj/git workspace in a sibling <repo>-wts/ folder"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Cmd>,
 
-    /// Parent revision the new workspace sits on (default: same parents as @)
+    /// Base revision/ref the new workspace sits on (jj: default same parents as
+    /// @; git: default HEAD, or the `wts.baseRef` config)
     #[arg(short, long)]
     revision: Option<String>,
 
-    /// Workspace name; if omitted, derived from the parent revision's
-    /// description (sanitized: lowercase, dashes, <=32 chars)
+    /// Workspace name; if omitted, derived from the base revision's
+    /// description/subject (sanitized: lowercase, dashes, <=32 chars)
     #[arg(short, long)]
     name: Option<String>,
 
@@ -49,20 +63,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Remove workspaces: jj workspace forget + delete each `<repo>-wts/<name>` folder
+    /// Remove workspaces: forget/remove the worktree + delete each `<repo>-wts/<name>` folder
     Rm {
         /// Workspace name(s) to remove; omit to remove the current workspace
         /// (only valid when run from inside a `<repo>-wts/<name>` workspace)
         names: Vec<String>,
     },
-    /// Print the shell integration (the `wts` function); run `wts init fish | source`
+    /// Print the shell integration (the `wts` function); e.g. `wts init fish | source`
     Init {
-        /// Shell to emit integration for (only `fish` is supported)
+        /// Shell to emit integration for: fish, bash, or zsh
         shell: String,
     },
-    /// Print shell completions; run `wts completions fish | source`
+    /// Print shell completions; e.g. `wts completions fish | source`
     Completions {
-        /// Shell to emit completions for (only `fish` is supported)
+        /// Shell to emit completions for: fish, bash, or zsh
         shell: String,
     },
 }
@@ -124,13 +138,16 @@ enum Action {
 /// Resolve action `name` to what it runs. A `wts.action.<name>` config entry
 /// wins; its value is either the literal `cd` (the built-in) or a script path.
 /// `cd` is also a built-in available without any config. Unknown names yield
-/// `None`. Action tables merge across jj config layers, so `--repo` entries
-/// extend the `--user` set.
-fn resolve_action(name: &str) -> Option<Action> {
-    let configured = jj_capture(&["config", "get", &format!("wts.action.{name}")])
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+/// `None`. Config layers merge (jj merges tables, git merges its config files),
+/// so `--repo`/`--local` entries extend the user-level set.
+fn resolve_action(backend: Backend, name: &str) -> Option<Action> {
+    let key = format!("wts.action.{name}");
+    let configured = match backend {
+        Backend::Jj => jj_capture(&["config", "get", &key]).ok(),
+        Backend::Git => git_capture(&["config", "--get", &key]).ok(),
+    }
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty());
     match configured.as_deref() {
         Some("cd") => Some(Action::Cd),
         Some(path) => Some(Action::Script(expand_tilde(path))),
@@ -170,14 +187,53 @@ fn run_action(script: &str, dest: &Path) {
 
 /// Run a jj command and return trimmed stdout, or the trimmed stderr as Err.
 fn jj_capture(args: &[&str]) -> Result<String, String> {
-    let out = Command::new("jj")
+    capture("jj", args)
+}
+
+/// Run a git command and return trimmed stdout, or the trimmed stderr as Err.
+/// git uses exit code 1 to mean "config key not set" (and similar absences), so
+/// callers reading optional config treat any Err as "unset".
+fn git_capture(args: &[&str]) -> Result<String, String> {
+    capture("git", args)
+}
+
+fn capture(program: &str, args: &[&str]) -> Result<String, String> {
+    let out = Command::new(program)
         .args(args)
         .output()
-        .map_err(|e| format!("failed to run jj: {e}"))?;
+        .map_err(|e| format!("failed to run {program}: {e}"))?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Read a scalar git config string, or `default` if unset/empty. git-only knob;
+/// the jj backend keeps its values hardcoded so its behavior is unchanged.
+fn git_config_str(key: &str, default: &str) -> String {
+    git_capture(&["config", "--get", key])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// Read a boolean git config knob (`--type=bool` normalizes true/yes/on/1), or
+/// `default` if unset.
+fn git_config_bool(key: &str, default: bool) -> bool {
+    match git_capture(&["config", "--type=bool", "--get", key]) {
+        Ok(s) => s.trim() == "true",
+        Err(_) => default,
+    }
+}
+
+/// The suffix for the sibling container dir (`<repo><suffix>`). git exposes this
+/// as `wts.containerSuffix`; jj keeps the historical `-wts`.
+fn container_suffix(backend: Backend) -> String {
+    match backend {
+        Backend::Jj => "-wts".to_string(),
+        Backend::Git => git_config_str("wts.containerSuffix", "-wts"),
+    }
 }
 
 /// lowercase, non-alphanumerics collapsed to single dashes, no leading/trailing
@@ -199,13 +255,13 @@ fn sanitize(s: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// Copy the files matched by the `wts.copy` jj config setting from the source
-/// workspace into the freshly-created one. These are the untracked/ignored files
-/// (e.g. `AGENTS.override.md`, `.env`) that jj does not carry into a new
-/// workspace on its own. Unset config copies nothing; missing matches are
+/// Copy the files matched by the `wts.copy` config from the source workspace into
+/// the freshly-created one. These are the untracked/ignored files (e.g.
+/// `AGENTS.override.md`, `.env`) that neither jj nor git carry into a new
+/// workspace on their own. Unset config copies nothing; missing matches are
 /// skipped silently; a copy failure is a warning, never fatal.
-fn copy_configured_files(source: &Path, dest: &Path) {
-    let patterns = copy_patterns();
+fn copy_configured_files(backend: Backend, source: &Path, dest: &Path) {
+    let patterns = copy_patterns(backend);
     let base = glob::Pattern::escape(&source.to_string_lossy());
     let mut copied = 0usize;
     for pat in &patterns {
@@ -229,13 +285,26 @@ fn copy_configured_files(source: &Path, dest: &Path) {
     }
 }
 
-/// Glob patterns to copy, read from the `wts.copy` jj config table
-/// (`wts.copy.<label> = "<glob>"`). A table is required because jj *merges*
-/// tables across config layers, so a per-repo entry extends the user-level set
-/// rather than replacing it. Entry keys are just labels; the string values are
-/// the globs. Unset (or any non-table value) yields none. `jj config list`
-/// prints valid TOML, so we parse it directly.
-fn copy_patterns() -> Vec<String> {
+/// Glob patterns to copy, read from the `wts.copy` config. Both backends are
+/// designed so a per-repo entry *extends* the user-level set rather than
+/// replacing it. The returned list is deduped and sorted for a deterministic
+/// copy order regardless of layer/merge.
+///
+/// - jj: the `wts.copy.<label> = "<glob>"` TOML table (jj merges tables across
+///   config layers). `jj config list` prints valid TOML, so we parse it.
+/// - git: the multi-valued `wts.copy = "<glob>"` key (git's idiomatic "a list
+///   local extends"), read with `git config --get-all --null wts.copy`.
+fn copy_patterns(backend: Backend) -> Vec<String> {
+    let mut pats = match backend {
+        Backend::Jj => copy_patterns_jj(),
+        Backend::Git => copy_patterns_git(),
+    };
+    pats.sort();
+    pats.dedup();
+    pats
+}
+
+fn copy_patterns_jj() -> Vec<String> {
     let listing = jj_capture(&["config", "list", "wts.copy"]).unwrap_or_default();
     if listing.is_empty() {
         return vec![];
@@ -248,15 +317,29 @@ fn copy_patterns() -> Vec<String> {
         }
     };
     match table.get("wts").and_then(|w| w.get("copy")) {
-        Some(toml::Value::Table(t)) => {
-            // Sorted for a deterministic copy order regardless of layer/merge.
-            let mut pats: Vec<String> =
-                t.values().filter_map(|v| v.as_str().map(str::to_string)).collect();
-            pats.sort();
-            pats
-        }
+        Some(toml::Value::Table(t)) => t
+            .values()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
         _ => vec![],
     }
+}
+
+fn copy_patterns_git() -> Vec<String> {
+    // `--null` separates values with NUL so globs/paths containing spaces stay
+    // intact; an unset key exits non-zero, which we treat as "no patterns".
+    let out = match Command::new("git")
+        .args(["config", "--get-all", "--null", "wts.copy"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return vec![],
+    };
+    String::from_utf8_lossy(&out)
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Recursively copy a file or directory, creating parent dirs as needed, and
@@ -278,17 +361,26 @@ fn copy_path(src: &Path, dst: &Path) -> std::io::Result<usize> {
     Ok(1)
 }
 
-/// The jj repo root of the current workspace.
-fn workspace_root() -> PathBuf {
-    PathBuf::from(
-        jj_capture(&["workspace", "root"])
-            .unwrap_or_else(|e| die(format!("not inside a jj repo: {e}"))),
-    )
+/// Detect the VCS backend and locate the repo root. jj wins in a colocated repo
+/// (a `.jj` dir at the root), otherwise we use git. Dies if we're in neither.
+fn detect_backend() -> (Backend, PathBuf) {
+    // jj first: in a colocated jj+git repo `.jj` is present, so jj wins,
+    // matching wts's historical behavior.
+    if let Ok(root) = jj_capture(&["workspace", "root"]) {
+        let root = PathBuf::from(root);
+        if root.join(".jj").is_dir() {
+            return (Backend::Jj, root);
+        }
+    }
+    if let Ok(top) = git_capture(&["rev-parse", "--show-toplevel"]) {
+        return (Backend::Git, PathBuf::from(top));
+    }
+    die("not inside a jj or git repo");
 }
 
-/// Resolve the `<repo>-wts/` container and the main repo path, whether `root` is
-/// the main repo itself or one of its `<repo>-wts/<name>` workspaces.
-fn resolve_layout(root: &Path) -> (PathBuf, PathBuf) {
+/// Resolve the `<repo><suffix>` container and the main repo path, whether `root`
+/// is the main repo itself or one of its `<repo><suffix>/<name>` workspaces.
+fn resolve_layout(root: &Path, suffix: &str) -> (PathBuf, PathBuf) {
     let parent = root
         .parent()
         .unwrap_or_else(|| die("repo root has no parent directory"));
@@ -296,10 +388,10 @@ fn resolve_layout(root: &Path) -> (PathBuf, PathBuf) {
         .file_name()
         .and_then(OsStr::to_str)
         .unwrap_or_else(|| die("cannot determine repo name from root path"));
-    // If the parent dir is itself a `<repo>-wts` container, we're inside a
+    // If the parent dir is itself a `<repo><suffix>` container, we're inside a
     // workspace: the container is the parent, the main repo its sibling.
     if let Some(pb) = parent.file_name().and_then(OsStr::to_str) {
-        if let Some(repo_name) = pb.strip_suffix("-wts") {
+        if let Some(repo_name) = pb.strip_suffix(suffix) {
             let main_repo = parent
                 .parent()
                 .map(|g| g.join(repo_name))
@@ -307,78 +399,153 @@ fn resolve_layout(root: &Path) -> (PathBuf, PathBuf) {
             return (parent.to_path_buf(), main_repo);
         }
     }
-    (parent.join(format!("{base}-wts")), root.to_path_buf())
+    (parent.join(format!("{base}{suffix}")), root.to_path_buf())
 }
 
-/// The jj name of the workspace we're currently in, if it's a `<repo>-wts/<name>`
+/// The name of the workspace we're currently in, if it's a `<repo><suffix>/<name>`
 /// worktree rather than the main repo. Returns None from the main repo (so a
-/// no-name `rm` there can't target the default workspace).
+/// no-name `rm` there can't target the main/default workspace).
 ///
-/// jj, not the folder name, is the source of truth for the name: we ask which
-/// workspace owns the current working copy. wts creates each workspace with its
+/// For jj we ask which workspace owns the current working copy (jj, not the
+/// folder name, is the source of truth): wts creates each workspace with its
 /// folder name as the jj name, but the two can diverge (e.g. `jj workspace
-/// rename`), and `jj workspace forget` needs the jj name. The folder name is
-/// only a fallback for when jj can't give an unambiguous answer (e.g. two
-/// workspaces sharing a working-copy commit).
-fn current_workspace_name(root: &Path) -> Option<String> {
-    // Gate on actually being inside a `-wts` container; this is what keeps the
-    // main/default workspace off-limits to a no-name `rm`.
+/// rename`), and `jj workspace forget` needs the jj name. For git a worktree has
+/// no identity beyond its directory, so the folder name *is* the name.
+fn current_workspace_name(backend: Backend, root: &Path, suffix: &str) -> Option<String> {
+    // Gate on actually being inside a `<suffix>` container; this is what keeps
+    // the main workspace off-limits to a no-name `rm`.
     let parent = root.parent()?;
-    parent.file_name().and_then(OsStr::to_str)?.strip_suffix("-wts")?;
+    parent.file_name().and_then(OsStr::to_str)?.strip_suffix(suffix)?;
 
-    let from_jj = jj_capture(&[
-        "workspace",
-        "list",
-        "--ignore-working-copy",
-        "-T",
-        "if(target.current_working_copy(), name ++ \"\\n\", \"\")",
-    ])
-    .ok()
-    .and_then(|out| {
-        let mut names: Vec<String> = out
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect();
-        // Exactly one current working copy is the unambiguous case; anything
-        // else (none, or several sharing a commit) falls back to the folder.
-        (names.len() == 1).then(|| names.remove(0))
-    });
+    let folder = || root.file_name().and_then(OsStr::to_str).map(str::to_string);
 
-    from_jj.or_else(|| root.file_name().and_then(OsStr::to_str).map(str::to_string))
+    match backend {
+        Backend::Git => folder(),
+        Backend::Jj => {
+            let from_jj = jj_capture(&[
+                "workspace",
+                "list",
+                "--ignore-working-copy",
+                "-T",
+                "if(target.current_working_copy(), name ++ \"\\n\", \"\")",
+            ])
+            .ok()
+            .and_then(|out| {
+                let mut names: Vec<String> = out
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                // Exactly one current working copy is the unambiguous case;
+                // anything else (none, or several sharing a commit) falls back
+                // to the folder.
+                (names.len() == 1).then(|| names.remove(0))
+            });
+            from_jj.or_else(folder)
+        }
+    }
+}
+
+/// The names of the workspaces the backend currently knows about (used so a
+/// typo'd `rm <name>` is a real error rather than a silent no-op). For git this
+/// is the linked worktrees' folder names; the main worktree is excluded.
+fn known_workspaces(backend: Backend, main_str: &str) -> Vec<String> {
+    match backend {
+        Backend::Jj => {
+            let listing =
+                jj_capture(&["-R", main_str, "workspace", "list"]).unwrap_or_default();
+            listing
+                .lines()
+                .filter_map(|l| l.split(':').next().map(str::trim))
+                .map(str::to_string)
+                .collect()
+        }
+        Backend::Git => {
+            let porcelain =
+                git_capture(&["-C", main_str, "worktree", "list", "--porcelain"]).unwrap_or_default();
+            linked_worktree_names(&porcelain)
+        }
+    }
+}
+
+/// Parse `git worktree list --porcelain` into the basenames of the *linked*
+/// worktrees, skipping the first record (always the main worktree).
+fn linked_worktree_names(porcelain: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut first = true;
+    for line in porcelain.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if first {
+                first = false;
+                continue;
+            }
+            if let Some(base) = Path::new(path).file_name().and_then(OsStr::to_str) {
+                names.push(base.to_string());
+            }
+        }
+    }
+    names
 }
 
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Some(Cmd::Rm { names }) => do_rm(names),
-        Some(Cmd::Init { shell }) => emit_shell_file(&shell, include_str!("../wts.fish")),
-        Some(Cmd::Completions { shell }) => {
-            emit_shell_file(&shell, include_str!("../completions/wts.fish"))
+        Some(Cmd::Rm { names }) => {
+            let (backend, root) = detect_backend();
+            do_rm(backend, root, names);
         }
-        None => do_create(cli.revision, cli.name, cli.action),
+        Some(Cmd::Init { shell }) => emit_init(&shell),
+        Some(Cmd::Completions { shell }) => emit_completions(&shell),
+        None => {
+            let (backend, root) = detect_backend();
+            do_create(backend, root, cli.revision, cli.name, cli.action);
+        }
     }
 }
 
-/// Print one of the embedded fish files for `init`/`completions`. Only fish is
-/// supported; the files are baked in at build time so a `cargo install`ed binary
-/// carries its own shell integration (no separate download).
-fn emit_shell_file(shell: &str, contents: &str) {
-    if shell != "fish" {
-        die(format!("unsupported shell '{shell}'; only fish is supported"));
-    }
+/// Print the embedded shell-integration function for `shell`. The files are
+/// baked in at build time so a `cargo install`ed binary carries its own shell
+/// integration (no separate download).
+fn emit_init(shell: &str) {
+    let contents = match shell {
+        "fish" => include_str!("../wts.fish"),
+        "bash" => include_str!("../wts.bash"),
+        "zsh" => include_str!("../wts.zsh"),
+        other => die(format!(
+            "unsupported shell '{other}'; supported: fish, bash, zsh"
+        )),
+    };
     print!("{contents}");
 }
 
-fn do_create(revision: Option<String>, name: Option<String>, action: Option<String>) {
-    let root = workspace_root();
-    let (container, _main_repo) = resolve_layout(&root);
+/// Print the embedded completions for `shell`.
+fn emit_completions(shell: &str) {
+    let contents = match shell {
+        "fish" => include_str!("../completions/wts.fish"),
+        "bash" => include_str!("../completions/wts.bash"),
+        "zsh" => include_str!("../completions/wts.zsh"),
+        other => die(format!(
+            "unsupported shell '{other}'; supported: fish, bash, zsh"
+        )),
+    };
+    print!("{contents}");
+}
+
+fn do_create(
+    backend: Backend,
+    root: PathBuf,
+    revision: Option<String>,
+    name: Option<String>,
+    action: Option<String>,
+) {
+    let suffix = container_suffix(backend);
+    let (container, _main_repo) = resolve_layout(&root, &suffix);
 
     // Resolve the action up front so an unknown one fails before we create
     // anything. `-a NAME`, else the action named `default`.
     let requested = action.as_deref().unwrap_or("default");
-    let act = resolve_action(requested).unwrap_or_else(|| {
+    let act = resolve_action(backend, requested).unwrap_or_else(|| {
         if action.is_some() {
             die(format!(
                 "no action '{requested}' configured; set wts.action.{requested}, or use the built-in `cd`"
@@ -386,37 +553,45 @@ fn do_create(revision: Option<String>, name: Option<String>, action: Option<Stri
         } else {
             die(
                 "no default action configured; pass -a/--action NAME, or set one with \
-                 e.g. `jj config set --user wts.action.default cd`",
+                 e.g. `jj config set --user wts.action.default cd` or `git config wts.action.default cd`",
             )
         }
     });
 
-    // Workspace name: explicit --name, else derived from the parent revision.
+    // For git, the base ref the new worktree checks out (and we name after):
+    // explicit --revision, else the `wts.baseRef` config (default HEAD). jj
+    // derives its base differently (see below), so this is only used for git.
+    let git_base = revision
+        .clone()
+        .unwrap_or_else(|| git_config_str("wts.baseRef", "HEAD"));
+
+    // Workspace name: explicit --name, else derived from the base revision.
     let workspace_name = match &name {
         Some(n) => sanitize(n),
-        None => {
-            // No --revision => the new working copy shares @'s parents, so the
-            // base revision we name after is @-.
-            let src_rev = revision.clone().unwrap_or_else(|| "@-".to_string());
-            // Grab the short change id and the description's first line in one
-            // shot (tab-separated) so we can prefix the name with the revision.
-            let raw = jj_capture(&[
-                "log", "--no-graph", "--ignore-working-copy", "--limit", "1",
-                "-r", &src_rev,
-                "-T", "change_id.shortest(8) ++ \"\\t\" ++ description.first_line()",
-            ])
-            .unwrap_or_default();
-            let (short, desc) = raw.split_once('\t').unwrap_or((raw.as_str(), ""));
-            // Prefix with the base revision's short change id, so auto-named
-            // workspaces off different revisions stay distinct and you can see
-            // what each sits on. With no description it's just the short id.
-            let base = if desc.trim().is_empty() {
-                short.to_string()
-            } else {
-                format!("{short}-{desc}")
-            };
-            sanitize(&base)
-        }
+        None => match backend {
+            Backend::Jj => {
+                // No --revision => the new working copy shares @'s parents, so
+                // the base revision we name after is @-.
+                let src_rev = revision.clone().unwrap_or_else(|| "@-".to_string());
+                // Grab the short change id and the description's first line in
+                // one shot (tab-separated) so we can prefix the name.
+                let raw = jj_capture(&[
+                    "log", "--no-graph", "--ignore-working-copy", "--limit", "1",
+                    "-r", &src_rev,
+                    "-T", "change_id.shortest(8) ++ \"\\t\" ++ description.first_line()",
+                ])
+                .unwrap_or_default();
+                let (short, desc) = raw.split_once('\t').unwrap_or((raw.as_str(), ""));
+                sanitize(&name_from(short, desc))
+            }
+            Backend::Git => {
+                // The short commit hash + subject of the base ref; mirrors jj's
+                // change-id + description naming.
+                let short = git_capture(&["rev-parse", "--short", &git_base]).unwrap_or_default();
+                let subj = git_capture(&["log", "-1", "--format=%s", &git_base]).unwrap_or_default();
+                sanitize(&name_from(&short, &subj))
+            }
+        },
     };
     if workspace_name.is_empty() {
         die("derived workspace name is empty; pass --name NAME");
@@ -438,27 +613,70 @@ fn do_create(revision: Option<String>, name: Option<String>, action: Option<Stri
     fs::create_dir_all(&container)
         .unwrap_or_else(|e| die(format!("cannot create {}: {e}", container.display())));
 
-    // Create the workspace (cwd-relative so @ resolves in the current workspace).
     let dest_str = dest.to_str().unwrap_or_else(|| die("non-utf8 destination path"));
-    let mut add: Vec<&str> = vec!["workspace", "add", "--name", &workspace_name];
-    if let Some(r) = &revision {
-        add.push("--revision");
-        add.push(r);
-    }
-    add.push(dest_str);
 
     eprintln!("wts: creating workspace '{workspace_name}' at {}", dest.display());
-    let status = Command::new("jj")
-        .args(&add)
-        .status()
-        .unwrap_or_else(|e| die(format!("failed to run jj: {e}")));
-    if !status.success() {
-        die("jj workspace add failed");
+    match backend {
+        Backend::Jj => {
+            // cwd-relative so @ resolves in the current workspace.
+            let mut add: Vec<&str> = vec!["workspace", "add", "--name", &workspace_name];
+            if let Some(r) = &revision {
+                add.push("--revision");
+                add.push(r);
+            }
+            add.push(dest_str);
+            let status = Command::new("jj")
+                .args(&add)
+                .status()
+                .unwrap_or_else(|e| die(format!("failed to run jj: {e}")));
+            if !status.success() {
+                die("jj workspace add failed");
+            }
+        }
+        Backend::Git => {
+            // By default create a branch named after the worktree (optionally
+            // prefixed), the git equivalent of jj's own working-copy commit: a
+            // place to accumulate work. It also sidesteps git's refusal to check
+            // out a branch already live in another worktree. `wts.createBranch
+            // false` checks out a detached HEAD instead.
+            let create_branch = git_config_bool("wts.createBranch", true);
+            let branch = format!("{}{}", git_config_str("wts.branchPrefix", ""), workspace_name);
+            let mut add: Vec<&str> = vec!["worktree", "add"];
+            if create_branch {
+                add.push("-b");
+                add.push(&branch);
+            } else {
+                add.push("--detach");
+            }
+            add.push(dest_str);
+            add.push(&git_base);
+            let status = Command::new("git")
+                .args(&add)
+                .status()
+                .unwrap_or_else(|e| die(format!("failed to run git: {e}")));
+            if !status.success() {
+                // git already printed the underlying reason. Add a hint for the
+                // cases its wording doesn't make obvious: most often the base ref
+                // doesn't resolve to a commit (an empty repo's unborn HEAD).
+                let base_ok = git_capture(&["rev-parse", "--verify", "--quiet", &format!("{git_base}^{{commit}}")])
+                    .is_ok();
+                if !base_ok {
+                    if git_base == "HEAD" {
+                        die("the repo has no commits yet — make an initial commit \
+                             (e.g. `git commit --allow-empty -m init`) before creating a worktree");
+                    }
+                    die(format!(
+                        "base ref '{git_base}' doesn't resolve to a commit; pass -r with a valid ref"
+                    ));
+                }
+                die("git worktree add failed (see git's message above)");
+            }
+        }
     }
 
-    // Carry over untracked files (AGENTS.override.md, .env, …) that jj doesn't
-    // bring into a new workspace itself; opt-in via the `wts.copy` jj config.
-    copy_configured_files(&root, &dest);
+    // Carry over untracked files (AGENTS.override.md, .env, …) that a new
+    // workspace doesn't get on its own; opt-in via the `wts.copy` config.
+    copy_configured_files(backend, &root, &dest);
 
     // Run the action resolved above. The built-in `cd` cds the shell in
     // (mirroring the subdirectory you were in); a script is handed the new
@@ -469,33 +687,62 @@ fn do_create(revision: Option<String>, name: Option<String>, action: Option<Stri
     }
 }
 
-fn do_rm(names: Vec<String>) {
-    let root = workspace_root();
-    let (container, main_repo) = resolve_layout(&root);
-
-    // Each removal carries a jj name (to forget) and a folder (to delete). For
-    // named args use `<name>` and `<container>/<name>`, wts's convention.
-    // With no name we target the current workspace: its jj name and its actual
-    // root path, both straight from jj, so it's correct even if the two diverge.
-    // Only valid inside a worktree; from the main repo there's nothing to remove
-    // (and we won't delete the main/default workspace).
-    let targets: Vec<(String, PathBuf)> = if names.is_empty() {
-        match current_workspace_name(&root) {
-            Some(name) => {
-                eprintln!("wts: removing current workspace '{name}'");
-                vec![(name, root.clone())]
-            }
-            None => die("no workspace name given and not inside a wts workspace"),
-        }
+/// Compose a workspace name from a short revision id and a description/subject:
+/// `<id>-<desc>`, or just `<id>` when the description is empty.
+fn name_from(short: &str, desc: &str) -> String {
+    if desc.trim().is_empty() {
+        short.to_string()
     } else {
-        names
-            .into_iter()
-            .map(|n| {
-                let dir = container.join(&n);
-                (n, dir)
-            })
-            .collect()
+        format!("{short}-{desc}")
+    }
+}
+
+/// Resolve a `wts rm` argument to a `(name, folder)` target. The argument is
+/// tried first as a worktree *name* (a plain `<container>/<name>` entry), then
+/// as a *path* (relative to cwd, or absolute) that must resolve to a folder
+/// sitting directly under the container. Returns None if it's neither — which is
+/// what stops `.`, `..`, or a stray path that lands on the container or the main
+/// repo from being mistaken for a removable workspace.
+fn resolve_rm_target(
+    container: &Path,
+    known: &[String],
+    cwd: Option<&Path>,
+    arg: &str,
+) -> Option<(String, PathBuf)> {
+    // Name case: a plain component (no separators, not `.`/`..`) that names a
+    // worktree under the container, registered or just present on disk.
+    let plain = !arg.is_empty()
+        && arg != "."
+        && arg != ".."
+        && !arg.contains('/')
+        && !arg.contains(std::path::MAIN_SEPARATOR);
+    if plain {
+        let dir = container.join(arg);
+        if known.iter().any(|k| k == arg) || dir.exists() {
+            return Some((arg.to_string(), dir));
+        }
+    }
+    // Path case: resolve relative to cwd (or absolute), and accept it only if it
+    // points at a folder directly inside the container. canonicalize requires
+    // the path to exist, so a typo'd name falls through to None here.
+    let raw = Path::new(arg);
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        cwd?.join(raw)
     };
+    let canon = fs::canonicalize(&joined).ok()?;
+    let container_canon = fs::canonicalize(container).ok()?;
+    if canon.parent()? == container_canon {
+        let name = canon.file_name().and_then(OsStr::to_str)?.to_string();
+        return Some((name, canon));
+    }
+    None
+}
+
+fn do_rm(backend: Backend, root: PathBuf, names: Vec<String>) {
+    let suffix = container_suffix(backend);
+    let (container, main_repo) = resolve_layout(&root, &suffix);
 
     let main_str = main_repo
         .to_str()
@@ -504,13 +751,34 @@ fn do_rm(names: Vec<String>) {
     let mut cwd_removed = false;
     let mut failed = false;
 
-    // Names jj currently knows about, so a typo'd name is a real error rather
-    // than a silent no-op (jj's own `workspace forget <missing>` just warns).
-    let listing = jj_capture(&["-R", main_str, "workspace", "list"]).unwrap_or_default();
-    let known: Vec<&str> = listing
-        .lines()
-        .filter_map(|l| l.split(':').next().map(str::trim))
-        .collect();
+    // Names the backend currently knows about, so a typo'd name is a real error.
+    let known = known_workspaces(backend, main_str);
+
+    // With no argument we target the current workspace (only valid inside a
+    // worktree; from the main repo there's nothing to remove). Otherwise each
+    // argument is resolved first as a worktree name, then as a path to a
+    // worktree folder (see resolve_rm_target).
+    let targets: Vec<(String, PathBuf)> = if names.is_empty() {
+        match current_workspace_name(backend, &root, &suffix) {
+            Some(name) => {
+                eprintln!("wts: removing current workspace '{name}'");
+                vec![(name, root.clone())]
+            }
+            None => die("no workspace name given and not inside a wts workspace"),
+        }
+    } else {
+        let mut out = Vec::new();
+        for arg in &names {
+            match resolve_rm_target(&container, &known, cwd.as_deref(), arg) {
+                Some(target) => out.push(target),
+                None => {
+                    eprintln!("wts: no such workspace: '{arg}'");
+                    failed = true;
+                }
+            }
+        }
+        out
+    };
 
     for (name, dir) in &targets {
         // `default` is jj's main workspace (the repo itself), not a wts-managed
@@ -521,54 +789,28 @@ fn do_rm(names: Vec<String>) {
             continue;
         }
 
-        let in_jj = known.contains(&name.as_str());
+        let in_vcs = known.iter().any(|k| k == name);
         let on_disk = dir.exists();
 
-        if !in_jj && !on_disk {
+        if !in_vcs && !on_disk {
             eprintln!("wts: no such workspace: '{name}'");
             failed = true;
             continue;
         }
 
-        // Forget via the main repo so we can drop a workspace even if it's the
-        // one we're currently standing in.
-        if in_jj {
-            let forgot = Command::new("jj")
-                .args(["-R", main_str, "workspace", "forget", name])
-                .status();
-            match forgot {
-                Ok(s) if s.success() => {}
-                Ok(_) => {
-                    eprintln!("wts: 'jj workspace forget {name}' failed; leaving folder in place");
-                    failed = true;
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("wts: failed to run jj: {e}");
-                    failed = true;
-                    continue;
-                }
-            }
-        }
+        let removing_cwd = cwd.as_deref().is_some_and(|c| c.starts_with(dir));
 
-        if on_disk {
-            if let Some(c) = &cwd {
-                if c.starts_with(dir) {
-                    cwd_removed = true;
-                }
-            }
-            match fs::remove_dir_all(dir) {
-                Ok(()) => eprintln!("wts: removed workspace '{name}' ({})", dir.display()),
-                Err(e) => {
-                    eprintln!(
-                        "wts: forgot '{name}' but could not delete {}: {e}",
-                        dir.display()
-                    );
+        match backend {
+            Backend::Jj => {
+                if remove_jj(main_str, name, dir, in_vcs, on_disk, removing_cwd, &mut cwd_removed) {
                     failed = true;
                 }
             }
-        } else {
-            eprintln!("wts: forgot '{name}' (no folder at {})", dir.display());
+            Backend::Git => {
+                if remove_git(main_str, name, dir, removing_cwd, &mut cwd_removed) {
+                    failed = true;
+                }
+            }
         }
     }
 
@@ -582,9 +824,102 @@ fn do_rm(names: Vec<String>) {
     }
 }
 
+/// jj removal: `jj workspace forget` (via the main repo, so we can drop the one
+/// we're standing in) then delete the folder. Returns true on failure.
+fn remove_jj(
+    main_str: &str,
+    name: &str,
+    dir: &Path,
+    in_vcs: bool,
+    on_disk: bool,
+    removing_cwd: bool,
+    cwd_removed: &mut bool,
+) -> bool {
+    // Forget is keyed on the jj name; a folder with no registered workspace just
+    // gets deleted below.
+    if in_vcs {
+        match Command::new("jj")
+            .args(["-R", main_str, "workspace", "forget", name])
+            .status()
+        {
+            Ok(s) if s.success() => {}
+            Ok(_) => {
+                eprintln!("wts: 'jj workspace forget {name}' failed; leaving folder in place");
+                return true;
+            }
+            Err(e) => {
+                eprintln!("wts: failed to run jj: {e}");
+                return true;
+            }
+        }
+    }
+
+    if on_disk {
+        match fs::remove_dir_all(dir) {
+            Ok(()) => {
+                if removing_cwd {
+                    *cwd_removed = true;
+                }
+                eprintln!("wts: removed workspace '{name}' ({})", dir.display());
+            }
+            Err(e) => {
+                eprintln!("wts: forgot '{name}' but could not delete {}: {e}", dir.display());
+                return true;
+            }
+        }
+    } else {
+        eprintln!("wts: forgot '{name}' (no folder at {})", dir.display());
+    }
+    false
+}
+
+/// git removal: `git worktree remove --force` (forgets + deletes the folder in
+/// one step) then delete the wts-created branch. Returns true on failure.
+fn remove_git(
+    main_str: &str,
+    name: &str,
+    dir: &Path,
+    removing_cwd: bool,
+    cwd_removed: &mut bool,
+) -> bool {
+    let removed = Command::new("git")
+        .args(["-C", main_str, "worktree", "remove", "--force"])
+        .arg(dir)
+        .output();
+    let ok = matches!(&removed, Ok(o) if o.status.success());
+
+    if !ok {
+        // The folder may have been deleted out from under git; prune the stale
+        // registration, then clean up any folder git left behind.
+        let _ = Command::new("git")
+            .args(["-C", main_str, "worktree", "prune"])
+            .output();
+        if dir.exists() {
+            if let Err(e) = fs::remove_dir_all(dir) {
+                eprintln!("wts: could not delete {}: {e}", dir.display());
+                return true;
+            }
+        }
+    }
+
+    if removing_cwd {
+        *cwd_removed = true;
+    }
+
+    // Delete the branch wts created for this worktree. Silent and best-effort:
+    // it's just cleanup, and a detached-HEAD worktree has no such branch.
+    let branch = format!("{}{}", git_config_str("wts.branchPrefix", ""), name);
+    let _ = Command::new("git")
+        .args(["-C", main_str, "branch", "-D", &branch])
+        .output();
+
+    eprintln!("wts: removed workspace '{name}' ({})", dir.display());
+    false
+}
+
 #[cfg(test)]
 mod tests {
-    use super::mirror_subpath_from;
+    use super::{linked_worktree_names, mirror_subpath_from, name_from, sanitize};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::{env, fs};
@@ -642,5 +977,52 @@ mod tests {
         fs::create_dir_all(&other).unwrap();
         assert_eq!(mirror_subpath_from(&source, &dest, &other), dest);
         fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn sanitize_lowercases_and_dashes() {
+        assert_eq!(sanitize("Hello World!"), "hello-world");
+        assert_eq!(sanitize("  --Foo__Bar--  "), "foo-bar");
+        assert_eq!(sanitize("a/b/c"), "a-b-c");
+    }
+
+    #[test]
+    fn sanitize_caps_at_32_chars() {
+        let s = sanitize(&"x".repeat(40));
+        assert_eq!(s.len(), 32);
+    }
+
+    #[test]
+    fn name_from_joins_or_drops_empty_desc() {
+        assert_eq!(name_from("abc123", "fix the bug"), "abc123-fix the bug");
+        assert_eq!(name_from("abc123", "   "), "abc123");
+        assert_eq!(name_from("abc123", ""), "abc123");
+    }
+
+    #[test]
+    fn linked_worktree_names_skips_main() {
+        let porcelain = "\
+worktree /home/me/repo
+HEAD aaaa
+branch refs/heads/main
+
+worktree /home/me/repo-wts/feature-a
+HEAD bbbb
+branch refs/heads/feature-a
+
+worktree /home/me/repo-wts/detached-one
+HEAD cccc
+detached
+";
+        assert_eq!(
+            linked_worktree_names(porcelain),
+            vec!["feature-a".to_string(), "detached-one".to_string()]
+        );
+    }
+
+    #[test]
+    fn linked_worktree_names_empty_when_only_main() {
+        let porcelain = "worktree /home/me/repo\nHEAD aaaa\nbranch refs/heads/main\n";
+        assert!(linked_worktree_names(porcelain).is_empty());
     }
 }
