@@ -9,6 +9,11 @@ wts rm <name>...                           # forget workspace(s) + delete folder
 wts rm                                      # forget + delete the current workspace
 ```
 
+Set a [`wts.action`](#customizing-the-action) to run anything in the new
+workspace — here, opening it in Claude Code:
+
+![wts creating a workspace and opening it in Claude Code](demo/demo.gif)
+
 ## What it does
 
 1. Resolves the current jj repo (workspace) root.
