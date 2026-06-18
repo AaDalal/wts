@@ -89,12 +89,13 @@ test -n "$WTS_CD_FILE"; and printf '%s\n' "$WTS_DIR" >$WTS_CD_FILE
 
 ### Example: open the workspace in cmux
 
-Point cmux at the directory with `--cwd` and title the session after the folder:
+Point cmux at the directory with `--cwd`, title the session after the folder,
+and `--focus true` to switch to it (cmux defaults to not focusing):
 
 ```fish
 #!/usr/bin/env fish
 # jj config set --user wts.action.cmux ~/.config/wts/cmux.fish
-cmux new-workspace --cwd $WTS_DIR --name "(wts) "(basename $WTS_DIR)
+cmux new-workspace --focus true --cwd $WTS_DIR --name "(wts) "(basename $WTS_DIR)
 ```
 
 `wts -n hotfix -a cmux` opens a cmux session in `…/<repo>-wts/hotfix` titled
