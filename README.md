@@ -1,50 +1,47 @@
-# wts
+<h1 align="center">wts</h1>
 
-Create (and remove) a [jujutsu](https://jj-vcs.github.io/jj/) workspace in a
-sibling `<repo>-wts/` folder and `cd` into it, in one command.
+<p align="center">
+Create a <a href="https://jj-vcs.github.io/jj/">jujutsu</a> workspace in a sibling folder and open it — in one command.
+</p>
+
+<p align="center">
+<a href="#how-it-works">How it works</a> &middot;
+<a href="#actions">Actions</a> &middot;
+<a href="#copying-untracked-files">Copying files</a> &middot;
+<a href="#removing-workspaces">Removing</a> &middot;
+<a href="#installation">Installation</a>
+</p>
+
+<p align="center">
+  <img src="demo/demo.gif" alt="wts creating a workspace and opening it in Claude Code" width="80%" />
+</p>
+<p align="center"><i>wts creates a workspace and hands it to an action — here, Claude Code.</i></p>
+
+## How it works
 
 ```
-wts [-r|--revision REV] [-n|--name NAME]   # create + cd into a new workspace
-wts rm <name>...                           # forget workspace(s) + delete folder(s)
-wts rm                                      # forget + delete the current workspace
+wts [-r REV] [-n NAME] [-a ACTION]   # create a workspace + run an action in it
+wts rm [<name>...]                   # forget + delete workspace(s), or the current one
 ```
 
-Configure an [action](#actions) to run in each new workspace — here, opening it
-in Claude Code:
+From inside a jj repo, `wts`:
 
-![wts creating a workspace and opening it in Claude Code](demo/demo.gif)
+1. Creates a workspace at `<repo>-wts/<name>`, a sibling folder. The name comes
+   from `-n`, else the **base revision** — its short change id plus description,
+   e.g. `qlvrqrmx-fix-the-login-bug` (just the id if there's no description).
+2. Copies any [untracked files you've opted into](#copying-untracked-files) from
+   the source workspace.
+3. Runs the chosen [action](#actions) in it.
 
-## What it does
-
-1. Resolves the current jj repo (workspace) root.
-2. Ensures a sibling container folder `<repo-name>-wts/` exists next to it.
-3. Creates a jj workspace inside it at `<repo-name>-wts/<workspace-name>`:
-   - `--name` if `-n` is given, otherwise derived from the **base revision** (the
-     `-r` revision, or `@-` when `-r` is omitted): its short change id, then its
-     description — e.g. `qlvrqrmx-fix-the-login-bug`, or just `qlvrqrmx` if the
-     revision has no description. The short-id prefix keeps auto-named workspaces
-     off different revisions distinct.
-   - The name is lowercased, non-alphanumerics become dashes, capped at 32 chars.
-   - Errors if that destination already exists and is non-empty.
-   - Passes `-r REV` through to `jj workspace add` so the new working copy sits
-     on top of that revision.
-4. Copies the untracked files listed in `wts.copy` (see below) from the source
-   workspace into the new one.
-5. Runs the chosen [action](#actions) in the new workspace — the one named
-   `default`, or the one you pass with `-a`. The built-in `cd` action moves your
-   shell in, mirroring the subdirectory you were in (running from `repo/src/foo`
-   lands you in `<new-ws>/src/foo`, falling back to the workspace root if that
-   subdirectory isn't there).
-
-Example: from `~/dev/acme`, `wts -n hotfix` creates and enters
-`~/dev/acme-wts/hotfix`.
+`-r REV` sets the revision the workspace sits on (default: the same parents as
+`@`). So from `~/dev/acme`, `wts -n hotfix` creates and opens `~/dev/acme-wts/hotfix`.
 
 ## Actions
 
-Each new workspace runs an **action**. Actions are named and live under
-`wts.action.<name>` in jj config; each value is a **script path** or the literal
-**`cd`** (a built-in that moves your shell into the workspace). `wts` runs the
-action named `default`, or the one you pass with `-a/--action`:
+Each new workspace runs an **action**. Actions are named, configured under
+`wts.action.<name>`; each value is a **script path** or the literal **`cd`** (a
+built-in that moves your shell into the workspace). `wts` runs `default`, or the
+action you pass with `-a`:
 
 ```fish
 jj config set --user wts.action.default cd                    # bare `wts` cds you in
@@ -57,172 +54,120 @@ wts -n hotfix -a edit    # runs `edit`
 wts -n hotfix -a cd      # the built-in `cd`, always available
 ```
 
-- `wts` with no `-a` runs `default`; if `wts.action.default` isn't set, it
-  errors. `-a NAME` for a name that isn't configured errors too, so typos
-  surface instead of silently doing nothing.
-- Action tables merge across jj config layers, so a `--repo` action **extends**
-  your `--user` set (and a per-repo `default` overrides the user one).
+- No `-a` runs `default`; if it isn't set, `wts` errors. `-a NAME` for an
+  unconfigured name errors too, so typos surface.
+- Action tables merge across config layers — a `--repo` action extends your
+  `--user` set, and a per-repo `default` overrides the user one.
 - A leading `~/` in a script path expands to `$HOME`.
 
 ### Writing a script action
 
-A script carries its own shebang (`#!/usr/bin/env fish`, `bash`, `python3`,
-`rust-script`, …) and receives the new workspace directory three ways: as its
-first argument (`$1`), as its working directory, and as `$WTS_DIR`. Its stdin,
-stdout and stderr are attached to your terminal, so it can be fully interactive
-(launch an editor, a shell, `claude`, tmux, …) and anything it spawns starts
-inside the workspace. Its exit code becomes `wts`'s.
-
-Example `~/.config/wts/edit.fish` — open the workspace in your editor, then drop
-into a shell there:
+A script carries its own shebang (`fish`, `bash`, `python3`, `rust-script`, …)
+and gets the new workspace directory three ways: as `$1`, as its working
+directory, and as `$WTS_DIR`. It runs attached to your terminal, so it can be
+fully interactive — launch an editor, a shell, `claude`, tmux — and anything it
+starts runs inside the workspace. Its exit code becomes `wts`'s.
 
 ```fish
 #!/usr/bin/env fish
+# ~/.config/wts/edit.fish — open the workspace in your editor, then a shell
 $EDITOR $WTS_DIR &
 exec fish
 ```
 
-### Moving your shell into the new workspace directory
+### Landing your shell in the workspace
 
-The built-in `cd` action moves your shell into the workspace. A script action
-can't do that directly (a child process can't change the calling shell's
-directory), but it can opt in by writing the path to `WTS_CD_FILE`, which the
-shell wrapper reads and `cd`s into:
+The built-in `cd` moves your shell into the new workspace. A script can't do
+that directly (a child can't change its parent's directory), but it can opt in
+by writing the path to `WTS_CD_FILE`, which the shell wrapper reads:
 
 ```fish
 test -n "$WTS_CD_FILE"; and printf '%s\n' "$WTS_DIR" >$WTS_CD_FILE
 ```
 
-The guard keeps the script working when run outside the wrapper (e.g. `cargo
-run`, where `WTS_CD_FILE` is unset).
+(The guard keeps it working when run outside the wrapper, like `cargo run`.)
 
 ### Example: open the workspace in cmux
 
-Point cmux at the directory with `--cwd $WTS_DIR` (it doesn't infer the directory
-from the calling shell), and title the session after the workspace folder:
+Point cmux at the directory with `--cwd` and title the session after the folder:
 
 ```fish
 #!/usr/bin/env fish
-# ~/.config/wts/cmux.fish — jj config set --user wts.action.cmux ~/.config/wts/cmux.fish
+# jj config set --user wts.action.cmux ~/.config/wts/cmux.fish
 cmux new-workspace --cwd $WTS_DIR --name "(wts) "(basename $WTS_DIR)
 ```
 
-`wts -n hotfix -a cmux` then opens a cmux workspace rooted at
-`…/<repo>-wts/hotfix` titled `(wts) hotfix`. (Set it as `wts.action.default` to
-make it the action bare `wts` runs.)
+`wts -n hotfix -a cmux` opens a cmux session in `…/<repo>-wts/hotfix` titled
+`(wts) hotfix`.
 
 ## Copying untracked files
 
-jj carries your **tracked** files into a new workspace, but ignored/untracked
-ones (`AGENTS.override.md`, `.env`, local tool config) stay behind. Declare glob
-patterns in the `wts.copy` jj config **table** and `wts` re-materializes the
-matching files from the source workspace into the new one. Each entry key is
-just a label; the string value is the glob:
+jj brings your **tracked** files into a new workspace, but untracked/ignored
+ones (`AGENTS.override.md`, `.env`, local tool config) stay behind. List globs
+under `wts.copy` and `wts` re-copies the matches from the source workspace:
 
 ```fish
-jj config set --user wts.copy.agents AGENTS.override.md   # applies everywhere
+jj config set --user wts.copy.agents AGENTS.override.md
 jj config set --user wts.copy.env '.env*'
-jj config set --repo wts.copy.local CLAUDE.local.md       # adds to the above in this repo
+jj config set --repo wts.copy.local CLAUDE.local.md   # adds to the above here
 ```
 
-- A **table** (not an array) is required on purpose: jj *merges* config tables
-  across layers, so a `--repo` entry **extends** your `--user` set rather than
-  replacing it. (jj replaces arrays wholesale, which is why they aren't used.)
-- Patterns are globs (`*`, `**`, `?`, `[...]`) resolved relative to the source
-  workspace root; matched directories are copied recursively.
-- Unset by default: nothing is copied unless you opt in. Missing matches are
-  skipped silently; a copy error is a warning, never fatal.
-- Inspect the rules in force for a repo with `jj config get wts.copy`, or
-  `jj config list wts.copy` to see each entry.
+The key is just a label; the value is the glob. Like `wts.action`, it's a table
+so `--repo` entries extend your `--user` set. Globs (`*`, `**`, `?`, `[...]`)
+resolve from the source root and copy directories recursively. Nothing is copied
+unless you opt in; a missing match is skipped, a copy error is a warning.
 
-## Install
+## Removing workspaces
 
-The `wts` binary does the work and writes the directory to `cd` into to a
-scratch file (named via `WTS_CD_FILE`); the fish function reads it and performs
-the `cd` (a child process can't change the parent shell's directory). Routing
-the `cd` through a file rather than stdout keeps the terminal free for an
-action script to run interactively. Requires `jj` on `PATH`.
+```
+wts rm <name>...    # forget + delete each <repo>-wts/<name>
+wts rm              # remove the workspace you're in
+```
 
-With [`just`](https://github.com/casey/just): `just install` (or `just
-reinstall` to redo it). By hand, from the repo root:
+`rm` works from anywhere in the repo, including inside the workspace it's
+deleting — when it removes the folder you're standing in, it sends your shell
+back to the main repo. With no name it removes the current workspace, asking jj
+for its name and root (so it's correct even if the folder and jj names have
+drifted); run from the main repo it errors rather than touching the default
+workspace.
+
+## Installation
+
+Needs [`jj`](https://jj-vcs.github.io/jj/) and
+[rust/cargo](https://rust-lang.org/tools/install/). With
+[`just`](https://github.com/casey/just): `just install` (`just reinstall` to
+redo it). By hand, from the repo root:
 
 ```fish
-# from the repo root ($PWD is its absolute path; symlink targets must be absolute)
-cargo install --path $PWD                          # builds + installs `wts` to ~/.cargo/bin
+cargo install --path $PWD                          # installs `wts` to ~/.cargo/bin
 ln -s $PWD/wts.fish ~/.config/fish/conf.d/wts.fish
 ln -s $PWD/completions/wts.fish ~/.config/fish/completions/wts.fish
 ```
 
-The fish function shadows the binary and reaches it via `command wts`, so make
-sure `~/.cargo/bin` is on `PATH`.
+The binary prints the directory to `cd` into; the fish function reads it and
+`cd`s (a child can't move the parent shell). It shadows the binary and reaches
+it via `command wts`, so keep `~/.cargo/bin` on `PATH`. Completions: `wts rm
+<TAB>` lists workspaces, `wts -r <TAB>` lists bookmarks, `wts -a <TAB>` lists
+actions.
 
-Completions: `wts rm <TAB>` lists the repo's workspaces (with their commit
-descriptions, `default` excluded) and `wts -r <TAB>` lists bookmarks.
+### Uninstall
 
-## Uninstall
-
-`just uninstall`, or reverse the three install steps by hand — drop the binary
-and remove the two symlinks:
-
-```fish
-cargo uninstall wts                               # removes `wts` from ~/.cargo/bin
-rm ~/.config/fish/conf.d/wts.fish                 # the shell function
-rm ~/.config/fish/completions/wts.fish            # the completions
-```
-
-This leaves your jj config untouched. To also forget the `wts.*` settings, unset
-each key (`wts.action.*` and `wts.copy.*` are tables, so remove their entries
-individually):
+`just uninstall`, or by hand:
 
 ```fish
-jj config unset --user wts.action.default         # one per wts.action entry
-jj config unset --user wts.copy.agents            # one per wts.copy entry
-jj config unset --user wts.copy.env
+cargo uninstall wts
+rm ~/.config/fish/conf.d/wts.fish ~/.config/fish/completions/wts.fish
 ```
 
-`jj config unset wts.action` (or `wts.copy`) won't work — jj refuses to delete a
-whole table at once ("Would delete entire table"), so you remove the entries one
-by one. To wipe the lot in a single step instead, open the config and delete the
-`[wts.action]` and `[wts.copy]` blocks by hand:
-
-```fish
-jj config edit --user                             # or --repo for repo-local settings
-```
-
-Already-created `<repo>-wts/<name>` workspaces are unaffected; remove them with
-`wts rm <name>` *before* uninstalling, or by hand afterward with
-`jj workspace forget <name>` plus deleting the folder.
+Your jj config is left alone. To drop it too, unset each `wts.action.*` /
+`wts.copy.*` key (jj won't delete a whole table at once), or `jj config edit
+--user` and remove the `[wts.action]` / `[wts.copy]` blocks. Existing workspaces
+are unaffected — `wts rm` them first.
 
 ## Develop
 
 ```
 cargo build          # debug build at target/debug/wts
-cargo run -- -n foo  # run without installing (no cd; prints the path)
-```
-
-## Removing workspaces
-
-```
-wts rm <name>            # jj workspace forget <name> + rm -rf <repo>-wts/<name>
-wts rm alpha beta        # several at once
-wts rm                   # remove the workspace you're currently in
-```
-
-`rm` works from the main repo or from inside another workspace, and even from
-inside the one you're deleting — when it removes the folder you were standing
-in, it prints the main repo path so the shell function cd's you back there. A
-name that's neither a known workspace nor a folder on disk is an error.
-
-With no name, `wts rm` removes the workspace you're standing in: it asks jj for
-the current workspace's name and forgets that, and deletes the current workspace
-root, so it stays correct even if the folder name and the jj workspace name have
-drifted apart. It's only valid from inside a `<repo>-wts/<name>` worktree — run
-from the main repo it errors rather than touching the default workspace, so you
-can't accidentally nuke the repo you launched from.
-
-You can still do it by hand with plain jj:
-
-```
-jj workspace list
-jj workspace forget <name>
+cargo test           # unit tests
+cargo run -- -n foo  # run without installing (prints the path; no cd)
 ```
