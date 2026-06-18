@@ -119,8 +119,7 @@ wts completions fish | source   # tab completions
 The function is needed because a child process can't cd the parent shell: the
 binary prints the target directory and the function cds into it.
 
-From a clone instead: `just install` builds with cargo and symlinks the fish
-files for you.
+From a clone, `cargo install --path .` instead of step 1; step 2 is the same.
 
 ### Develop
 

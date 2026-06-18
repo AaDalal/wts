@@ -1,8 +1,7 @@
 # Completions for `wts`.
 #
-# Load via `wts completions fish | source` in config.fish, or symlink into a
-# fish completions dir:
-#     ln -s $PWD/completions/wts.fish ~/.config/fish/completions/wts.fish
+# The binary embeds this file; load it with `wts completions fish | source` in
+# ~/.config/fish/config.fish.
 
 # Registered jj workspaces (excluding `default`), as name<TAB>commit-description.
 function __wts_workspaces

@@ -1,9 +1,7 @@
 # wts.fish: shell wrapper for the wts binary.
 #
-# Load it either way (the binary embeds this file, so `wts init` prints it):
-#   * `wts init fish | source` in ~/.config/fish/config.fish, or
-#   * symlink it into a fish autoload dir:
-#       ln -s $PWD/wts.fish ~/.config/fish/conf.d/wts.fish
+# The binary embeds this file; load it with `wts init fish | source` in
+# ~/.config/fish/config.fish.
 #
 # A child process can't change the parent shell's cwd, so the `wts` binary
 # writes a target directory into the scratch file named by WTS_CD_FILE and this
