@@ -25,8 +25,11 @@ wts rm                                      # forget + delete the current worksp
      on top of that revision.
 4. Copies the untracked files listed in `wts.copy` (see below) from the source
    workspace into the new one.
-5. Runs the **action**: by default, `cd`s into the new workspace; or, if you've
-   set `wts.action`, runs your script there instead (see below).
+5. Runs the **action**: by default, `cd`s into the new workspace — mirroring the
+   subdirectory you were in, so running from `repo/src/foo` lands you in
+   `<new-ws>/src/foo` (falling back to the workspace root if that subdirectory
+   isn't there). Or, if you've set `wts.action`, runs your script there instead
+   (see below).
 
 Example: from `~/Documents/dev/sail`, `wts -n hotfix` creates and enters
 `~/Documents/dev/sail-wts/hotfix`.
@@ -50,21 +53,37 @@ ways, so use whichever is convenient:
 - as its working directory (`$PWD`),
 - as the `WTS_DIR` environment variable.
 
-A leading `~/` in the configured path expands to `$HOME`. The script's stdin,
-stdout and stderr are attached to your terminal, so it can be fully interactive.
-Its exit code becomes `wts`'s exit code (the workspace is already created either
-way). When `wts.action` is set it **replaces** the `cd` — a child process can't
-change your shell's directory, so if you want to land in the new workspace, have
-your action start a shell there (e.g. `cd "$WTS_DIR"; exec fish`). Unset (the
-default) keeps the plain `cd`.
+A leading `~/` in the configured path expands to `$HOME`. The script runs **with
+the new workspace as its working directory**, and its stdin, stdout and stderr
+are attached to your terminal — so it can be fully interactive (launch an editor,
+a shell, `claude`, tmux, …) and anything it spawns starts inside the workspace
+without a `cd`. Its exit code becomes `wts`'s exit code (the workspace is already
+created either way). Unset (the default) keeps the plain `cd`.
+
+### Moving your shell into the new workspace directory
+
+Setting `wts.action` turns off the default behavior of `cd`-ing your shell into
+the new workspace directory. A `cd` inside the action only changes the action's
+own directory, not the terminal you ran `wts` from. To end up in the new
+workspace, do one of:
+
+- Start a shell or program from the action — it already runs in the workspace
+  (see the editor example below), so you're there for as long as it's open.
+- Write `$WTS_DIR` to `WTS_CD_FILE` to make your terminal `cd` in, just like the
+  default does. The shell wrapper passes that variable to the action; guard on it
+  so the script still works when run directly (e.g. `cargo run`):
+
+  ```fish
+  test -n "$WTS_CD_FILE"; and printf '%s\n' "$WTS_DIR" >$WTS_CD_FILE
+  ```
 
 Example `~/.config/wts/on-create.fish` that opens the workspace in your editor
-and then drops you into a shell there:
+and then drops you into a shell there (no `cd` needed — the action already runs
+in `$WTS_DIR`):
 
 ```fish
 #!/usr/bin/env fish
 $EDITOR $WTS_DIR &
-cd $WTS_DIR
 exec fish
 ```
 
@@ -118,6 +137,9 @@ the `cd` (a child process can't change the parent shell's directory). Routing
 the `cd` through a file rather than stdout keeps the terminal free for a
 `wts.action` script to run interactively. Requires `jj` on `PATH`.
 
+With [`just`](https://github.com/casey/just): `just install` (or `just
+reinstall` to redo it). By hand, from the repo root:
+
 ```fish
 # from the repo root ($PWD is its absolute path; symlink targets must be absolute)
 cargo install --path $PWD                          # builds + installs `wts` to ~/.cargo/bin
@@ -133,7 +155,8 @@ descriptions, `default` excluded) and `wts -r <TAB>` lists bookmarks.
 
 ## Uninstall
 
-Reverse the three install steps — drop the binary and remove the two symlinks:
+`just uninstall`, or reverse the three install steps by hand — drop the binary
+and remove the two symlinks:
 
 ```fish
 cargo uninstall wts                               # removes `wts` from ~/.cargo/bin

@@ -67,6 +67,36 @@ fn emit_cd(path: &Path) {
     }
 }
 
+/// The directory under `dest` mirroring where you currently are within `source`,
+/// so running `wts` from `repo/src/foo` lands you in `<new-ws>/src/foo`. Falls
+/// back to `dest` itself when you're at the source root, the path can't be
+/// resolved, or that subdirectory wasn't carried into the new workspace.
+fn mirror_subpath(source: &Path, dest: &Path) -> PathBuf {
+    match env::current_dir() {
+        Ok(cwd) => mirror_subpath_from(source, dest, &cwd),
+        Err(_) => dest.to_path_buf(),
+    }
+}
+
+/// Core of [`mirror_subpath`], with `cwd` passed in so it's testable.
+fn mirror_subpath_from(source: &Path, dest: &Path, cwd: &Path) -> PathBuf {
+    let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let Some(rel) = canon(cwd)
+        .strip_prefix(canon(source))
+        .ok()
+        .map(Path::to_path_buf)
+        .filter(|rel| !rel.as_os_str().is_empty())
+    else {
+        return dest.to_path_buf();
+    };
+    let target = dest.join(rel);
+    if target.is_dir() {
+        target
+    } else {
+        dest.to_path_buf()
+    }
+}
+
 /// Path to the configured `wts.action` script, if any. A leading `~/` expands to
 /// `$HOME`; an unset or empty value yields `None`.
 fn action_script() -> Option<String> {
@@ -368,11 +398,12 @@ fn do_create(revision: Option<String>, name: Option<String>) {
     // bring into a new workspace itself; opt-in via the `wts.copy` jj config.
     copy_configured_files(&root, &dest);
 
-    // Default action is to cd into the new workspace; a `wts.action` script
-    // replaces that and is handed the new directory instead.
+    // Default action is to cd into the new workspace, mirroring the subdirectory
+    // you were in; a `wts.action` script replaces that and is handed the new
+    // workspace root instead.
     match action_script() {
         Some(script) => run_action(&script, &dest),
-        None => emit_cd(&dest),
+        None => emit_cd(&mirror_subpath(&root, &dest)),
     }
 }
 
@@ -478,5 +509,68 @@ fn do_rm(names: Vec<String>) {
     }
     if failed {
         exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mirror_subpath_from;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{env, fs};
+
+    static N: AtomicUsize = AtomicUsize::new(0);
+
+    /// A fresh, unique temp directory for one test to populate.
+    fn scratch() -> PathBuf {
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let dir = env::temp_dir().join(format!("wts-test-{}-{id}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn mirrors_a_subdir_present_in_dest() {
+        let base = scratch();
+        let (source, dest) = (base.join("src"), base.join("dst"));
+        fs::create_dir_all(source.join("a/b")).unwrap();
+        fs::create_dir_all(dest.join("a/b")).unwrap();
+        assert_eq!(
+            mirror_subpath_from(&source, &dest, &source.join("a/b")),
+            dest.join("a/b")
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn falls_back_to_dest_when_subdir_missing_in_dest() {
+        let base = scratch();
+        let (source, dest) = (base.join("src"), base.join("dst"));
+        fs::create_dir_all(source.join("a/b")).unwrap();
+        fs::create_dir_all(&dest).unwrap(); // dest exists, but dest/a/b does not
+        assert_eq!(mirror_subpath_from(&source, &dest, &source.join("a/b")), dest);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn returns_dest_at_source_root() {
+        let base = scratch();
+        let (source, dest) = (base.join("src"), base.join("dst"));
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        assert_eq!(mirror_subpath_from(&source, &dest, &source), dest);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn returns_dest_when_cwd_is_outside_source() {
+        let base = scratch();
+        let (source, dest, other) =
+            (base.join("src"), base.join("dst"), base.join("other/deep"));
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        assert_eq!(mirror_subpath_from(&source, &dest, &other), dest);
+        fs::remove_dir_all(&base).ok();
     }
 }
