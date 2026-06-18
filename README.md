@@ -6,6 +6,7 @@ sibling `<repo>-wts/` folder and `cd` into it, in one command.
 ```
 wts [-r|--revision REV] [-n|--name NAME]   # create + cd into a new workspace
 wts rm <name>...                           # forget workspace(s) + delete folder(s)
+wts rm                                      # forget + delete the current workspace
 ```
 
 ## What it does
@@ -13,8 +14,11 @@ wts rm <name>...                           # forget workspace(s) + delete folder
 1. Resolves the current jj repo (workspace) root.
 2. Ensures a sibling container folder `<repo-name>-wts/` exists next to it.
 3. Creates a jj workspace inside it at `<repo-name>-wts/<workspace-name>`:
-   - `--name` if `-n` is given, otherwise derived from the **parent revision's**
-     description (the `-r` revision, or `@-` when `-r` is omitted).
+   - `--name` if `-n` is given, otherwise derived from the **base revision** (the
+     `-r` revision, or `@-` when `-r` is omitted): its short change id, then its
+     description — e.g. `qlvrqrmx-fix-the-login-bug`, or just `qlvrqrmx` if the
+     revision has no description. The short-id prefix keeps auto-named workspaces
+     off different revisions distinct.
    - The name is lowercased, non-alphanumerics become dashes, capped at 32 chars.
    - Errors if that destination already exists and is non-empty.
    - Passes `-r REV` through to `jj workspace add` so the new working copy sits
@@ -171,12 +175,20 @@ cargo run -- -n foo  # run without installing (no cd; prints the path)
 ```
 wts rm <name>            # jj workspace forget <name> + rm -rf <repo>-wts/<name>
 wts rm alpha beta        # several at once
+wts rm                   # remove the workspace you're currently in
 ```
 
 `rm` works from the main repo or from inside another workspace, and even from
 inside the one you're deleting — when it removes the folder you were standing
 in, it prints the main repo path so the shell function cd's you back there. A
 name that's neither a known workspace nor a folder on disk is an error.
+
+With no name, `wts rm` removes the workspace you're standing in: it asks jj for
+the current workspace's name and forgets that, and deletes the current workspace
+root, so it stays correct even if the folder name and the jj workspace name have
+drifted apart. It's only valid from inside a `<repo>-wts/<name>` worktree — run
+from the main repo it errors rather than touching the default workspace, so you
+can't accidentally nuke the repo you launched from.
 
 You can still do it by hand with plain jj:
 

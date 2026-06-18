@@ -45,8 +45,8 @@ struct Cli {
 enum Cmd {
     /// Remove workspaces: jj workspace forget + delete each `<repo>-wts/<name>` folder
     Rm {
-        /// Workspace name(s) to remove
-        #[arg(required = true)]
+        /// Workspace name(s) to remove; omit to remove the current workspace
+        /// (only valid when run from inside a `<repo>-wts/<name>` workspace)
         names: Vec<String>,
     },
 }
@@ -248,6 +248,45 @@ fn resolve_layout(root: &Path) -> (PathBuf, PathBuf) {
     (parent.join(format!("{base}-wts")), root.to_path_buf())
 }
 
+/// The jj name of the workspace we're currently in, if it's a `<repo>-wts/<name>`
+/// worktree rather than the main repo. Returns None from the main repo (so a
+/// no-name `rm` there can't target the default workspace).
+///
+/// jj — not the folder name — is the source of truth for the name: we ask which
+/// workspace owns the current working copy. wts creates each workspace with its
+/// folder name as the jj name, but the two can diverge (e.g. `jj workspace
+/// rename`), and `jj workspace forget` needs the jj name. The folder name is
+/// only a fallback for when jj can't give an unambiguous answer (e.g. two
+/// workspaces sharing a working-copy commit).
+fn current_workspace_name(root: &Path) -> Option<String> {
+    // Gate on actually being inside a `-wts` container; this is what keeps the
+    // main/default workspace off-limits to a no-name `rm`.
+    let parent = root.parent()?;
+    parent.file_name().and_then(OsStr::to_str)?.strip_suffix("-wts")?;
+
+    let from_jj = jj_capture(&[
+        "workspace",
+        "list",
+        "--ignore-working-copy",
+        "-T",
+        "if(target.current_working_copy(), name ++ \"\\n\", \"\")",
+    ])
+    .ok()
+    .and_then(|out| {
+        let mut names: Vec<String> = out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        // Exactly one current working copy is the unambiguous case; anything
+        // else (none, or several sharing a commit) falls back to the folder.
+        (names.len() == 1).then(|| names.remove(0))
+    });
+
+    from_jj.or_else(|| root.file_name().and_then(OsStr::to_str).map(str::to_string))
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
@@ -265,21 +304,24 @@ fn do_create(revision: Option<String>, name: Option<String>) {
         Some(n) => sanitize(n),
         None => {
             // No --revision => the new working copy shares @'s parents, so the
-            // "parent revision" we name after is @-.
+            // base revision we name after is @-.
             let src_rev = revision.clone().unwrap_or_else(|| "@-".to_string());
-            let desc = jj_capture(&[
+            // Grab the short change id and the description's first line in one
+            // shot (tab-separated) so we can prefix the name with the revision.
+            let raw = jj_capture(&[
                 "log", "--no-graph", "--ignore-working-copy", "--limit", "1",
-                "-r", &src_rev, "-T", "description.first_line()",
+                "-r", &src_rev,
+                "-T", "change_id.shortest(8) ++ \"\\t\" ++ description.first_line()",
             ])
             .unwrap_or_default();
+            let (short, desc) = raw.split_once('\t').unwrap_or((raw.as_str(), ""));
+            // Prefix with the base revision's short change id, so auto-named
+            // workspaces off different revisions stay distinct and you can see
+            // what each sits on. With no description it's just the short id.
             let base = if desc.trim().is_empty() {
-                jj_capture(&[
-                    "log", "--no-graph", "--ignore-working-copy", "--limit", "1",
-                    "-r", &src_rev, "-T", "change_id.shortest(8)",
-                ])
-                .unwrap_or_default()
+                short.to_string()
             } else {
-                desc
+                format!("{short}-{desc}")
             };
             sanitize(&base)
         }
@@ -337,6 +379,31 @@ fn do_create(revision: Option<String>, name: Option<String>) {
 fn do_rm(names: Vec<String>) {
     let root = workspace_root();
     let (container, main_repo) = resolve_layout(&root);
+
+    // Each removal carries a jj name (to forget) and a folder (to delete). For
+    // named args those are `<name>` and `<container>/<name>` — wts's convention.
+    // With no name we target the current workspace: its jj name and its actual
+    // root path, both straight from jj, so it's correct even if the two diverge.
+    // Only valid inside a worktree — from the main repo there's nothing to remove
+    // (and we won't delete the main/default workspace).
+    let targets: Vec<(String, PathBuf)> = if names.is_empty() {
+        match current_workspace_name(&root) {
+            Some(name) => {
+                eprintln!("wts: removing current workspace '{name}'");
+                vec![(name, root.clone())]
+            }
+            None => die("no workspace name given and not inside a wts workspace"),
+        }
+    } else {
+        names
+            .into_iter()
+            .map(|n| {
+                let dir = container.join(&n);
+                (n, dir)
+            })
+            .collect()
+    };
+
     let main_str = main_repo
         .to_str()
         .unwrap_or_else(|| die("non-utf8 repo path"));
@@ -352,8 +419,7 @@ fn do_rm(names: Vec<String>) {
         .filter_map(|l| l.split(':').next().map(str::trim))
         .collect();
 
-    for name in &names {
-        let dir = container.join(name);
+    for (name, dir) in &targets {
         let in_jj = known.contains(&name.as_str());
         let on_disk = dir.exists();
 
@@ -386,11 +452,11 @@ fn do_rm(names: Vec<String>) {
 
         if on_disk {
             if let Some(c) = &cwd {
-                if c.starts_with(&dir) {
+                if c.starts_with(dir) {
                     cwd_removed = true;
                 }
             }
-            match fs::remove_dir_all(&dir) {
+            match fs::remove_dir_all(dir) {
                 Ok(()) => eprintln!("wts: removed workspace '{name}' ({})", dir.display()),
                 Err(e) => {
                     eprintln!(
