@@ -1,4 +1,4 @@
-//! wts — create or remove jj workspaces in a sibling `<repo>-wts/` folder.
+//! wts: create or remove jj workspaces in a sibling `<repo>-wts/` folder.
 //!
 //! With no subcommand it creates a workspace; `wts rm <name>...` forgets
 //! workspaces and deletes their folders. Human-facing messages go to stderr.
@@ -6,12 +6,12 @@
 //! A child process cannot change the parent shell's directory, so when wts wants
 //! the shell to cd somewhere it writes the target path to the file named by the
 //! `WTS_CD_FILE` env var (set by the `wts` shell function), which then cd's
-//! there — into the new workspace on create, or back to the main repo after `rm`
+//! there: into the new workspace on create, or back to the main repo after `rm`
 //! deletes the folder you were standing in. Run without `WTS_CD_FILE` (e.g. a
 //! direct `cargo run`) there's no shell to cd, so the path just appears on
 //! stderr with the rest of the diagnostics.
 //!
-//! What a new workspace does once created is its **action** — `-a NAME`, else
+//! What a new workspace does once created is its **action**: `-a NAME`, else
 //! the action named `default`. Actions are configured under `wts.action.<name>`
 //! (a script path, or the literal `cd` for the built-in cd; see `resolve_action`).
 
@@ -55,6 +55,16 @@ enum Cmd {
         /// (only valid when run from inside a `<repo>-wts/<name>` workspace)
         names: Vec<String>,
     },
+    /// Print the shell integration (the `wts` function); run `wts init fish | source`
+    Init {
+        /// Shell to emit integration for (only `fish` is supported)
+        shell: String,
+    },
+    /// Print shell completions; run `wts completions fish | source`
+    Completions {
+        /// Shell to emit completions for (only `fish` is supported)
+        shell: String,
+    },
 }
 
 fn die(msg: impl AsRef<str>) -> ! {
@@ -64,7 +74,7 @@ fn die(msg: impl AsRef<str>) -> ! {
 
 /// Tell the shell wrapper where to cd by writing the path to the scratch file it
 /// names in `WTS_CD_FILE`. With no `WTS_CD_FILE` (e.g. a direct `cargo run`,
-/// outside the wrapper) there's nothing to cd, so this is a no-op — the path is
+/// outside the wrapper) there's nothing to cd, so this is a no-op: the path is
 /// already on stderr via the "creating workspace …" message.
 fn emit_cd(path: &Path) {
     let Some(file) = env::var_os("WTS_CD_FILE") else { return };
@@ -143,7 +153,7 @@ fn expand_tilde(s: &str) -> String {
 /// shebang (fish, bash, python, rust-script, …) and is run with the workspace as
 /// both its working directory and its sole argument, and with that path also
 /// exported as `$WTS_DIR`. Stdio is inherited so interactive actions (opening an
-/// editor, starting a shell) work. The action's exit code becomes ours — the
+/// editor, starting a shell) work. The action's exit code becomes ours; the
 /// workspace was already created, so this only reports how the action fared.
 fn run_action(script: &str, dest: &Path) {
     eprintln!("wts: running action ({script})");
@@ -193,7 +203,7 @@ fn sanitize(s: &str) -> String {
 /// workspace into the freshly-created one. These are the untracked/ignored files
 /// (e.g. `AGENTS.override.md`, `.env`) that jj does not carry into a new
 /// workspace on its own. Unset config copies nothing; missing matches are
-/// skipped silently — a copy failure is a warning, never fatal.
+/// skipped silently; a copy failure is a warning, never fatal.
 fn copy_configured_files(source: &Path, dest: &Path) {
     let patterns = copy_patterns();
     let base = glob::Pattern::escape(&source.to_string_lossy());
@@ -304,7 +314,7 @@ fn resolve_layout(root: &Path) -> (PathBuf, PathBuf) {
 /// worktree rather than the main repo. Returns None from the main repo (so a
 /// no-name `rm` there can't target the default workspace).
 ///
-/// jj — not the folder name — is the source of truth for the name: we ask which
+/// jj, not the folder name, is the source of truth for the name: we ask which
 /// workspace owns the current working copy. wts creates each workspace with its
 /// folder name as the jj name, but the two can diverge (e.g. `jj workspace
 /// rename`), and `jj workspace forget` needs the jj name. The folder name is
@@ -343,8 +353,22 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Some(Cmd::Rm { names }) => do_rm(names),
+        Some(Cmd::Init { shell }) => emit_shell_file(&shell, include_str!("../wts.fish")),
+        Some(Cmd::Completions { shell }) => {
+            emit_shell_file(&shell, include_str!("../completions/wts.fish"))
+        }
         None => do_create(cli.revision, cli.name, cli.action),
     }
+}
+
+/// Print one of the embedded fish files for `init`/`completions`. Only fish is
+/// supported; the files are baked in at build time so a `cargo install`ed binary
+/// carries its own shell integration (no separate download).
+fn emit_shell_file(shell: &str, contents: &str) {
+    if shell != "fish" {
+        die(format!("unsupported shell '{shell}'; only fish is supported"));
+    }
+    print!("{contents}");
 }
 
 fn do_create(revision: Option<String>, name: Option<String>, action: Option<String>) {
@@ -450,10 +474,10 @@ fn do_rm(names: Vec<String>) {
     let (container, main_repo) = resolve_layout(&root);
 
     // Each removal carries a jj name (to forget) and a folder (to delete). For
-    // named args those are `<name>` and `<container>/<name>` — wts's convention.
+    // named args use `<name>` and `<container>/<name>`, wts's convention.
     // With no name we target the current workspace: its jj name and its actual
     // root path, both straight from jj, so it's correct even if the two diverge.
-    // Only valid inside a worktree — from the main repo there's nothing to remove
+    // Only valid inside a worktree; from the main repo there's nothing to remove
     // (and we won't delete the main/default workspace).
     let targets: Vec<(String, PathBuf)> = if names.is_empty() {
         match current_workspace_name(&root) {
@@ -490,7 +514,7 @@ fn do_rm(names: Vec<String>) {
 
     for (name, dir) in &targets {
         // `default` is jj's main workspace (the repo itself), not a wts-managed
-        // sibling — refuse it so `wts rm default` can't detach the main repo.
+        // sibling. Refuse it so `wts rm default` can't detach the main repo.
         if name == "default" {
             eprintln!("wts: refusing to remove the 'default' (main) workspace");
             failed = true;

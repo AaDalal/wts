@@ -1,6 +1,7 @@
 # Completions for `wts`.
 #
-# Install: symlink into fish's completions dir, e.g. from the repo root
+# Load via `wts completions fish | source` in config.fish, or symlink into a
+# fish completions dir:
 #     ln -s $PWD/completions/wts.fish ~/.config/fish/completions/wts.fish
 
 # Registered jj workspaces (excluding `default`), as name<TAB>commit-description.

@@ -22,8 +22,8 @@ _say "wts creates a jj workspace in a sibling folder and runs an action in it."
 _say "Here the action opens the new workspace in Claude Code:"
 _run 'cat ~/.config/wts/claude.fish'
 
-_say "Create a workspace for some new work — wts hands it straight to Claude:"
+_say "Create a workspace for some new work; wts hands it straight to Claude:"
 _run 'wts -n add-dark-mode'
 
-_say "Claude ran inside .../acme-api-wts/add-dark-mode — a fresh, isolated workspace."
+_say "Claude ran inside .../acme-api-wts/add-dark-mode, a fresh, isolated workspace."
 sleep 1.2

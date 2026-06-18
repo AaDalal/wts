@@ -1,4 +1,4 @@
-# wts — build/install helpers. Run `just` to list recipes.
+# wts build/install helpers. Run `just` to list recipes.
 
 repo := justfile_directory()
 fish_conf := env_var('HOME') / ".config/fish/conf.d/wts.fish"

@@ -2,7 +2,14 @@
 name = "wts"
 version = "0.1.0"
 edition = "2021"
-description = "Create a jj workspace in a sibling <repo>-wts/ folder and cd into it"
+description = "Create a jujutsu workspace in a sibling <repo>-wts/ folder and run an action in it"
+license = "MIT"
+repository = "https://github.com/AaDalal/wts"
+homepage = "https://github.com/AaDalal/wts"
+readme = "README.md"
+keywords = ["jujutsu", "jj", "workspace", "worktree", "fish"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["demo/demo.cast"]
 
 [[bin]]
 name = "wts"
