@@ -115,9 +115,10 @@ the `cd` through a file rather than stdout keeps the terminal free for a
 `wts.action` script to run interactively. Requires `jj` on `PATH`.
 
 ```fish
-cargo install --path ~/Documents/dev/wts          # builds + installs `wts` to ~/.cargo/bin
-ln -s ~/Documents/dev/wts/wts.fish ~/.config/fish/conf.d/wts.fish
-ln -s ~/Documents/dev/wts/completions/wts.fish ~/.config/fish/completions/wts.fish
+# from the repo root ($PWD is its absolute path; symlink targets must be absolute)
+cargo install --path $PWD                          # builds + installs `wts` to ~/.cargo/bin
+ln -s $PWD/wts.fish ~/.config/fish/conf.d/wts.fish
+ln -s $PWD/completions/wts.fish ~/.config/fish/completions/wts.fish
 ```
 
 The fish function shadows the binary and reaches it via `command wts`, so make

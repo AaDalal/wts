@@ -1,8 +1,8 @@
 # wts.fish — shell wrapper for the wts binary.
 #
 # Install the binary first (`cargo install --path .` puts `wts` on PATH), then
-# symlink this file into a directory fish autoloads, e.g.
-#     ln -s ~/Documents/dev/wts/wts.fish ~/.config/fish/conf.d/wts.fish
+# symlink this file into a directory fish autoloads, e.g. from the repo root
+#     ln -s $PWD/wts.fish ~/.config/fish/conf.d/wts.fish
 #
 # A child process can't change the parent shell's cwd, so the `wts` binary
 # writes a target directory into the scratch file named by WTS_CD_FILE and this

@@ -1,7 +1,7 @@
 # Completions for `wts`.
 #
-# Install: symlink into fish's completions dir, e.g.
-#     ln -s ~/Documents/dev/wts/completions/wts.fish ~/.config/fish/completions/wts.fish
+# Install: symlink into fish's completions dir, e.g. from the repo root
+#     ln -s $PWD/completions/wts.fish ~/.config/fish/completions/wts.fish
 
 # Registered jj workspaces (excluding `default`), as name<TAB>commit-description.
 function __wts_workspaces
@@ -22,9 +22,11 @@ end
 complete -c wts -f
 
 # Top level (no subcommand yet): the `rm` subcommand + the create flags.
+# `-x` (exclusive) = requires an argument AND suppresses file completion for it;
+# plain `-r`/`--require-parameter` would still let fish offer filenames.
 complete -c wts -n __fish_use_subcommand -a rm -d 'Remove workspace(s)'
-complete -c wts -n __fish_use_subcommand -s n -l name -r -d 'Name for the new workspace'
-complete -c wts -n __fish_use_subcommand -s r -l revision -r -a '(__wts_bookmarks)' \
+complete -c wts -n __fish_use_subcommand -s n -l name -x -d 'Name for the new workspace'
+complete -c wts -n __fish_use_subcommand -s r -l revision -x -a '(__wts_bookmarks)' \
     -d 'Parent revision for the new workspace'
 complete -c wts -s h -l help -d 'Show help'
 
