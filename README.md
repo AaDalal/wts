@@ -1,7 +1,7 @@
 <h1 align="center">wts</h1>
 
 <p align="center">
-Spin up a <a href="https://jj-vcs.github.io/jj/">jujutsu</a> workspace in a sibling folder and jump straight into it
+Create <a href="https://jj-vcs.github.io/jj/">jujutsu</a> workspace and set it up
 </p>
 
 <p align="center">

@@ -1,8 +1,8 @@
 [package]
 name = "wts"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-description = "Create a jujutsu workspace in a sibling <repo>-wts/ folder and run an action in it"
+description = "Create a jujutsu workspace and set it up"
 license = "MIT"
 repository = "https://github.com/AaDalal/wts"
 homepage = "https://github.com/AaDalal/wts"
