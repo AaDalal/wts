@@ -36,8 +36,8 @@ workspace — here, opening it in Claude Code:
    isn't there). Or, if you've set `wts.action`, runs your script there instead
    (see below).
 
-Example: from `~/Documents/dev/sail`, `wts -n hotfix` creates and enters
-`~/Documents/dev/sail-wts/hotfix`.
+Example: from `~/dev/acme`, `wts -n hotfix` creates and enters
+`~/dev/acme-wts/hotfix`.
 
 ## Customizing the action
 
