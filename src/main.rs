@@ -11,8 +11,9 @@
 //! direct `cargo run`) there's no shell to cd, so the path just appears on
 //! stderr with the rest of the diagnostics.
 //!
-//! The default "cd into the new workspace" step can be replaced per-repo by a
-//! `wts.action` jj config pointing at an executable script (see `run_action`).
+//! What a new workspace does once created is its **action** — `-a NAME`, else
+//! the action named `default`. Actions are configured under `wts.action.<name>`
+//! (a script path, or the literal `cd` for the built-in cd; see `resolve_action`).
 
 use std::env;
 use std::ffi::OsStr;
@@ -39,6 +40,11 @@ struct Cli {
     /// description (sanitized: lowercase, dashes, <=32 chars)
     #[arg(short, long)]
     name: Option<String>,
+
+    /// Action to run in the new workspace (a `wts.action.<name>` entry, or the
+    /// built-in `cd`); defaults to the action named `default`
+    #[arg(short, long)]
+    action: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -97,12 +103,29 @@ fn mirror_subpath_from(source: &Path, dest: &Path, cwd: &Path) -> PathBuf {
     }
 }
 
-/// Path to the configured `wts.action` script, if any. A leading `~/` expands to
-/// `$HOME`; an unset or empty value yields `None`.
-fn action_script() -> Option<String> {
-    match jj_capture(&["config", "get", "wts.action"]) {
-        Ok(s) if !s.trim().is_empty() => Some(expand_tilde(s.trim())),
-        _ => None,
+/// What running `wts` does in the new workspace once it's created.
+enum Action {
+    /// Built-in: cd the shell into the workspace (mirroring the subdirectory).
+    Cd,
+    /// Run a user script (path already tilde-expanded).
+    Script(String),
+}
+
+/// Resolve action `name` to what it runs. A `wts.action.<name>` config entry
+/// wins; its value is either the literal `cd` (the built-in) or a script path.
+/// `cd` is also a built-in available without any config. Unknown names yield
+/// `None`. Action tables merge across jj config layers, so `--repo` entries
+/// extend the `--user` set.
+fn resolve_action(name: &str) -> Option<Action> {
+    let configured = jj_capture(&["config", "get", &format!("wts.action.{name}")])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    match configured.as_deref() {
+        Some("cd") => Some(Action::Cd),
+        Some(path) => Some(Action::Script(expand_tilde(path))),
+        None if name == "cd" => Some(Action::Cd),
+        None => None,
     }
 }
 
@@ -116,21 +139,20 @@ fn expand_tilde(s: &str) -> String {
     }
 }
 
-/// Run the configured `wts.action` in place of the default cd. The script
-/// carries its own shebang (fish, bash, python, rust-script, …) and is run with
-/// the new workspace as both its working directory and its sole argument, and
-/// with that path also exported as `$WTS_DIR`. Stdio is inherited so interactive
-/// actions (opening an editor, starting a shell) work. The action's exit code
-/// becomes ours — the workspace was already created, so this only reports how
-/// the action itself fared.
+/// Run an action `script` in the new workspace. The script carries its own
+/// shebang (fish, bash, python, rust-script, …) and is run with the workspace as
+/// both its working directory and its sole argument, and with that path also
+/// exported as `$WTS_DIR`. Stdio is inherited so interactive actions (opening an
+/// editor, starting a shell) work. The action's exit code becomes ours — the
+/// workspace was already created, so this only reports how the action fared.
 fn run_action(script: &str, dest: &Path) {
-    eprintln!("wts: running wts.action ({script})");
+    eprintln!("wts: running action ({script})");
     let status = Command::new(script)
         .arg(dest)
         .env("WTS_DIR", dest)
         .current_dir(dest)
         .status()
-        .unwrap_or_else(|e| die(format!("failed to run wts.action '{script}': {e}")));
+        .unwrap_or_else(|e| die(format!("failed to run action '{script}': {e}")));
     if !status.success() {
         exit(status.code().unwrap_or(1));
     }
@@ -321,13 +343,29 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Some(Cmd::Rm { names }) => do_rm(names),
-        None => do_create(cli.revision, cli.name),
+        None => do_create(cli.revision, cli.name, cli.action),
     }
 }
 
-fn do_create(revision: Option<String>, name: Option<String>) {
+fn do_create(revision: Option<String>, name: Option<String>, action: Option<String>) {
     let root = workspace_root();
     let (container, _main_repo) = resolve_layout(&root);
+
+    // Resolve the action up front so an unknown one fails before we create
+    // anything. `-a NAME`, else the action named `default`.
+    let requested = action.as_deref().unwrap_or("default");
+    let act = resolve_action(requested).unwrap_or_else(|| {
+        if action.is_some() {
+            die(format!(
+                "no action '{requested}' configured; set wts.action.{requested}, or use the built-in `cd`"
+            ))
+        } else {
+            die(
+                "no default action configured; pass -a/--action NAME, or set one with \
+                 e.g. `jj config set --user wts.action.default cd`",
+            )
+        }
+    });
 
     // Workspace name: explicit --name, else derived from the parent revision.
     let workspace_name = match &name {
@@ -398,12 +436,12 @@ fn do_create(revision: Option<String>, name: Option<String>) {
     // bring into a new workspace itself; opt-in via the `wts.copy` jj config.
     copy_configured_files(&root, &dest);
 
-    // Default action is to cd into the new workspace, mirroring the subdirectory
-    // you were in; a `wts.action` script replaces that and is handed the new
+    // Run the action resolved above. The built-in `cd` cds the shell in
+    // (mirroring the subdirectory you were in); a script is handed the new
     // workspace root instead.
-    match action_script() {
-        Some(script) => run_action(&script, &dest),
-        None => emit_cd(&mirror_subpath(&root, &dest)),
+    match act {
+        Action::Cd => emit_cd(&mirror_subpath(&root, &dest)),
+        Action::Script(script) => run_action(&script, &dest),
     }
 }
 

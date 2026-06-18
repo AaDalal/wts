@@ -9,8 +9,8 @@ wts rm <name>...                           # forget workspace(s) + delete folder
 wts rm                                      # forget + delete the current workspace
 ```
 
-Set a [`wts.action`](#customizing-the-action) to run anything in the new
-workspace — here, opening it in Claude Code:
+Configure an [action](#actions) to run in each new workspace — here, opening it
+in Claude Code:
 
 ![wts creating a workspace and opening it in Claude Code](demo/demo.gif)
 
@@ -30,61 +30,51 @@ workspace — here, opening it in Claude Code:
      on top of that revision.
 4. Copies the untracked files listed in `wts.copy` (see below) from the source
    workspace into the new one.
-5. Runs the **action**: by default, `cd`s into the new workspace — mirroring the
-   subdirectory you were in, so running from `repo/src/foo` lands you in
-   `<new-ws>/src/foo` (falling back to the workspace root if that subdirectory
-   isn't there). Or, if you've set `wts.action`, runs your script there instead
-   (see below).
+5. Runs the chosen [action](#actions) in the new workspace — the one named
+   `default`, or the one you pass with `-a`. The built-in `cd` action moves your
+   shell in, mirroring the subdirectory you were in (running from `repo/src/foo`
+   lands you in `<new-ws>/src/foo`, falling back to the workspace root if that
+   subdirectory isn't there).
 
 Example: from `~/dev/acme`, `wts -n hotfix` creates and enters
 `~/dev/acme-wts/hotfix`.
 
-## Customizing the action
+## Actions
 
-By default, creating a workspace just `cd`s your shell into it. Set the
-`wts.action` jj config to an **executable script** to run something else
-instead — open an editor, start a shell or tmux session, kick off an agent, etc:
+Each new workspace runs an **action**. Actions are named and live under
+`wts.action.<name>` in jj config; each value is a **script path** or the literal
+**`cd`** (a built-in that moves your shell into the workspace). `wts` runs the
+action named `default`, or the one you pass with `-a/--action`:
 
 ```fish
-jj config set --user wts.action ~/.config/wts/on-create.fish   # everywhere
-jj config set --repo wts.action ./.wts-action                  # just this repo
+jj config set --user wts.action.default cd                    # bare `wts` cds you in
+jj config set --user wts.action.edit ~/.config/wts/edit.fish  # a named script action
 ```
 
-The script carries its own shebang (`#!/usr/bin/env fish`, `bash`, `python3`,
-`rust-script`, …) and is run with the **new workspace directory** delivered three
-ways, so use whichever is convenient:
+```
+wts -n hotfix            # runs `default`
+wts -n hotfix -a edit    # runs `edit`
+wts -n hotfix -a cd      # the built-in `cd`, always available
+```
 
-- as its first argument (`$1`),
-- as its working directory (`$PWD`),
-- as the `WTS_DIR` environment variable.
+- `wts` with no `-a` runs `default`; if `wts.action.default` isn't set, it
+  errors. `-a NAME` for a name that isn't configured errors too, so typos
+  surface instead of silently doing nothing.
+- Action tables merge across jj config layers, so a `--repo` action **extends**
+  your `--user` set (and a per-repo `default` overrides the user one).
+- A leading `~/` in a script path expands to `$HOME`.
 
-A leading `~/` in the configured path expands to `$HOME`. The script runs **with
-the new workspace as its working directory**, and its stdin, stdout and stderr
-are attached to your terminal — so it can be fully interactive (launch an editor,
-a shell, `claude`, tmux, …) and anything it spawns starts inside the workspace
-without a `cd`. Its exit code becomes `wts`'s exit code (the workspace is already
-created either way). Unset (the default) keeps the plain `cd`.
+### Writing a script action
 
-### Moving your shell into the new workspace directory
+A script carries its own shebang (`#!/usr/bin/env fish`, `bash`, `python3`,
+`rust-script`, …) and receives the new workspace directory three ways: as its
+first argument (`$1`), as its working directory, and as `$WTS_DIR`. Its stdin,
+stdout and stderr are attached to your terminal, so it can be fully interactive
+(launch an editor, a shell, `claude`, tmux, …) and anything it spawns starts
+inside the workspace. Its exit code becomes `wts`'s.
 
-Setting `wts.action` turns off the default behavior of `cd`-ing your shell into
-the new workspace directory. A `cd` inside the action only changes the action's
-own directory, not the terminal you ran `wts` from. To end up in the new
-workspace, do one of:
-
-- Start a shell or program from the action — it already runs in the workspace
-  (see the editor example below), so you're there for as long as it's open.
-- Write `$WTS_DIR` to `WTS_CD_FILE` to make your terminal `cd` in, just like the
-  default does. The shell wrapper passes that variable to the action; guard on it
-  so the script still works when run directly (e.g. `cargo run`):
-
-  ```fish
-  test -n "$WTS_CD_FILE"; and printf '%s\n' "$WTS_DIR" >$WTS_CD_FILE
-  ```
-
-Example `~/.config/wts/on-create.fish` that opens the workspace in your editor
-and then drops you into a shell there (no `cd` needed — the action already runs
-in `$WTS_DIR`):
+Example `~/.config/wts/edit.fish` — open the workspace in your editor, then drop
+into a shell there:
 
 ```fish
 #!/usr/bin/env fish
@@ -92,23 +82,34 @@ $EDITOR $WTS_DIR &
 exec fish
 ```
 
+### Moving your shell into the new workspace directory
+
+The built-in `cd` action moves your shell into the workspace. A script action
+can't do that directly (a child process can't change the calling shell's
+directory), but it can opt in by writing the path to `WTS_CD_FILE`, which the
+shell wrapper reads and `cd`s into:
+
+```fish
+test -n "$WTS_CD_FILE"; and printf '%s\n' "$WTS_DIR" >$WTS_CD_FILE
+```
+
+The guard keeps the script working when run outside the wrapper (e.g. `cargo
+run`, where `WTS_CD_FILE` is unset).
+
 ### Example: open the workspace in cmux
 
-Hand each new workspace to cmux as its own session. Point cmux at the directory
-with `--cwd $WTS_DIR` (it does **not** infer the directory from the calling
-shell's cwd, so passing the path explicitly is what makes the session open in
-the right place). The session title is derived from the workspace folder and
-tagged so cmux sessions created this way are easy to spot:
+Point cmux at the directory with `--cwd $WTS_DIR` (it doesn't infer the directory
+from the calling shell), and title the session after the workspace folder:
 
 ```fish
 #!/usr/bin/env fish
-# ~/.config/wts/cmux.fish — set via: jj config set --user wts.action ~/.config/wts/cmux.fish
+# ~/.config/wts/cmux.fish — jj config set --user wts.action.cmux ~/.config/wts/cmux.fish
 cmux new-workspace --cwd $WTS_DIR --name "(wts) "(basename $WTS_DIR)
 ```
 
-`wts -n hotfix` then opens a cmux workspace rooted at `…/<repo>-wts/hotfix` with
-the title `(wts) hotfix`. (The simpler `cmux $WTS_DIR` also opens the directory
-in a new workspace, but doesn't let you set the title.)
+`wts -n hotfix -a cmux` then opens a cmux workspace rooted at
+`…/<repo>-wts/hotfix` titled `(wts) hotfix`. (Set it as `wts.action.default` to
+make it the action bare `wts` runs.)
 
 ## Copying untracked files
 
@@ -139,8 +140,8 @@ jj config set --repo wts.copy.local CLAUDE.local.md       # adds to the above in
 The `wts` binary does the work and writes the directory to `cd` into to a
 scratch file (named via `WTS_CD_FILE`); the fish function reads it and performs
 the `cd` (a child process can't change the parent shell's directory). Routing
-the `cd` through a file rather than stdout keeps the terminal free for a
-`wts.action` script to run interactively. Requires `jj` on `PATH`.
+the `cd` through a file rather than stdout keeps the terminal free for an
+action script to run interactively. Requires `jj` on `PATH`.
 
 With [`just`](https://github.com/casey/just): `just install` (or `just
 reinstall` to redo it). By hand, from the repo root:
@@ -170,18 +171,19 @@ rm ~/.config/fish/completions/wts.fish            # the completions
 ```
 
 This leaves your jj config untouched. To also forget the `wts.*` settings, unset
-each key:
+each key (`wts.action.*` and `wts.copy.*` are tables, so remove their entries
+individually):
 
 ```fish
-jj config unset --user wts.action                 # and any --repo you set
+jj config unset --user wts.action.default         # one per wts.action entry
 jj config unset --user wts.copy.agents            # one per wts.copy entry
 jj config unset --user wts.copy.env
 ```
 
-`jj config unset wts.copy` won't work — jj refuses to delete a whole table at
-once ("Would delete entire table"), so you remove the `wts.copy.*` entries one
+`jj config unset wts.action` (or `wts.copy`) won't work — jj refuses to delete a
+whole table at once ("Would delete entire table"), so you remove the entries one
 by one. To wipe the lot in a single step instead, open the config and delete the
-`[wts.copy]` block (and the `wts.action` line) by hand:
+`[wts.action]` and `[wts.copy]` blocks by hand:
 
 ```fish
 jj config edit --user                             # or --repo for repo-local settings
