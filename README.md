@@ -137,6 +137,17 @@ wts rm             # remove the one you're in (and send you back to the main rep
 
 Works from anywhere in the repo. It won't touch the main (`default`) worktree.
 
+If removal would orphan unpushed work, `wts rm` warns with the commit id (it
+never blocks). On git that means the branch tip isn't reachable from any other
+branch, tag, or remote — the warning includes a `git branch <name> <sha>`
+recovery command, since the commits are otherwise only recoverable until gc. On
+jj nothing is deleted (forgotten work stays visible in `jj log`); the warning
+lists the change ids so you can find them. A branch merged on GitHub via a
+*squash or rebase* merge has rewritten commits, so after the remote branch is
+auto-deleted and pruned its local commits look unpushed and the warning still
+fires — read it as "these exact commits exist nowhere else", not "this work is
+unmerged".
+
 ### Installation
 
 You'll need [`jj`](https://jj-vcs.github.io/jj/) **or**
