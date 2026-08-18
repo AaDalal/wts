@@ -1,6 +1,6 @@
 [package]
 name = "wts"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Create a git worktree or jujutsu workspace and set it up"
 license = "MIT"
