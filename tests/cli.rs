@@ -471,6 +471,151 @@ fn git_knob_container_suffix() {
     cleanup(&s);
 }
 
+/// Commit a file inside worktree `dir` and return the new tip sha.
+fn commit_in_worktree(dir: &Path, scratch_dir: &Path, file: &str) -> String {
+    fs::write(dir.join(file), "work\n").unwrap();
+    git(dir, scratch_dir, &["add", "."]);
+    git(dir, scratch_dir, &["commit", "-m", "wip work"]);
+    git(dir, scratch_dir, &["rev-parse", "HEAD"])
+}
+
+#[test]
+fn git_rm_warns_on_unpushed_commits() {
+    let s = scratch();
+    let repo = mk_git_repo(&s);
+
+    run_wts(&repo, &s, &["-n", "feature-x", "-a", "cd"], &[]);
+    let dest = s.join("repo-wts").join("feature-x");
+    let tip = commit_in_worktree(&dest, &s, "wip.txt");
+
+    let r = run_wts(&repo, &s, &["rm", "feature-x"], &[]);
+    assert!(r.success, "rm failed: {}", r.stderr);
+    // Removal proceeds — the warning must not block it.
+    assert!(!dest.exists(), "worktree folder not removed");
+    assert!(
+        git(&repo, &s, &["branch", "--list", "feature-x"]).is_empty(),
+        "branch not deleted"
+    );
+
+    // The warning names the branch, the tip commit, and how to recover it.
+    assert!(
+        r.stderr.contains("warning"),
+        "expected a warning in stderr, got:\n{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains(&tip),
+        "warning should include tip sha {tip}, got:\n{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains(&format!("git branch feature-x {tip}")),
+        "warning should include a recovery command, got:\n{}",
+        r.stderr
+    );
+
+    // The commit object is still recoverable from the printed sha.
+    git(&repo, &s, &["cat-file", "-e", &format!("{tip}^{{commit}}")]);
+
+    cleanup(&s);
+}
+
+#[test]
+fn git_rm_no_warning_without_unique_commits() {
+    let s = scratch();
+    let repo = mk_git_repo(&s);
+
+    run_wts(&repo, &s, &["-n", "feature-x", "-a", "cd"], &[]);
+    // No commits made in the worktree: its branch tip is still on main.
+    let r = run_wts(&repo, &s, &["rm", "feature-x"], &[]);
+    assert!(r.success, "rm failed: {}", r.stderr);
+    assert!(
+        !r.stderr.contains("warning"),
+        "unexpected warning for a branch with no unique commits:\n{}",
+        r.stderr
+    );
+
+    cleanup(&s);
+}
+
+#[test]
+fn git_rm_no_warning_when_pushed() {
+    let s = scratch();
+    let repo = mk_git_repo(&s);
+
+    run_wts(&repo, &s, &["-n", "feature-x", "-a", "cd"], &[]);
+    let dest = s.join("repo-wts").join("feature-x");
+    commit_in_worktree(&dest, &s, "wip.txt");
+
+    // Push to a local bare "origin"; the remote-tracking ref now covers the tip.
+    let remote = s.join("remote.git");
+    git(&repo, &s, &["init", "--bare", remote.to_str().unwrap()]);
+    git(&repo, &s, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    git(&repo, &s, &["push", "origin", "feature-x"]);
+
+    let r = run_wts(&repo, &s, &["rm", "feature-x"], &[]);
+    assert!(r.success, "rm failed: {}", r.stderr);
+    assert!(
+        !r.stderr.contains("warning"),
+        "unexpected warning for a pushed branch:\n{}",
+        r.stderr
+    );
+
+    cleanup(&s);
+}
+
+#[test]
+fn git_rm_no_warning_after_merge() {
+    let s = scratch();
+    let repo = mk_git_repo(&s);
+
+    run_wts(&repo, &s, &["-n", "feature-x", "-a", "cd"], &[]);
+    let dest = s.join("repo-wts").join("feature-x");
+    commit_in_worktree(&dest, &s, "wip.txt");
+
+    // A true merge (or fast-forward) keeps the branch's commits reachable from
+    // main — the GitHub merge-commit + auto-branch-deletion flow lands here.
+    git(&repo, &s, &["merge", "--no-edit", "feature-x"]);
+
+    let r = run_wts(&repo, &s, &["rm", "feature-x"], &[]);
+    assert!(r.success, "rm failed: {}", r.stderr);
+    assert!(
+        !r.stderr.contains("warning"),
+        "unexpected warning for a merged branch:\n{}",
+        r.stderr
+    );
+
+    cleanup(&s);
+}
+
+#[test]
+fn git_rm_warns_after_squash_merge() {
+    let s = scratch();
+    let repo = mk_git_repo(&s);
+
+    run_wts(&repo, &s, &["-n", "feature-x", "-a", "cd"], &[]);
+    let dest = s.join("repo-wts").join("feature-x");
+    let tip = commit_in_worktree(&dest, &s, "wip.txt");
+
+    // A squash merge rewrites the work into a new commit, so the branch's own
+    // commits stay unreachable from main. The warning fires by design: wts
+    // can't tell rewritten-but-merged work from never-merged work, and the
+    // warning is informational (removal still proceeds).
+    git(&repo, &s, &["merge", "--squash", "feature-x"]);
+    git(&repo, &s, &["commit", "-m", "squashed feature-x"]);
+
+    let r = run_wts(&repo, &s, &["rm", "feature-x"], &[]);
+    assert!(r.success, "rm failed: {}", r.stderr);
+    assert!(!dest.exists(), "worktree folder not removed");
+    assert!(
+        r.stderr.contains("warning") && r.stderr.contains(&tip),
+        "expected a warning naming tip {tip} after squash merge:\n{}",
+        r.stderr
+    );
+
+    cleanup(&s);
+}
+
 #[test]
 fn git_no_default_action_errors() {
     let s = scratch();
@@ -596,6 +741,132 @@ fn jj_rm_by_name() {
     assert!(
         !list.lines().any(|l| l.starts_with("feature-x")),
         "jj still lists feature-x after rm:\n{list}"
+    );
+
+    cleanup(&s);
+}
+
+#[test]
+fn jj_rm_warns_on_unpushed_work() {
+    if !jj_available() {
+        eprintln!("skipping jj_rm_warns_on_unpushed_work: jj not installed");
+        return;
+    }
+    let s = scratch();
+    let repo = mk_jj_repo(&s);
+
+    let c = run_wts(&repo, &s, &["-n", "feature-x", "-a", "cd"], &[]);
+    assert!(c.success, "jj create failed: {}", c.stderr);
+    let dest = s.join("repo-wts").join("feature-x");
+
+    // Make and snapshot work in the workspace, then read its commit id.
+    fs::write(dest.join("wip.txt"), "work\n").unwrap();
+    jj(&dest, &s, &["status"]);
+    let commit_id = jj(
+        &repo,
+        &s,
+        &["log", "--no-graph", "--ignore-working-copy", "-r", "\"feature-x\"@", "-T", "commit_id"],
+    );
+
+    let r = run_wts(&repo, &s, &["rm", "feature-x"], &[]);
+    assert!(r.success, "jj rm failed: {}", r.stderr);
+    assert!(!dest.exists(), "workspace folder not removed");
+
+    // The warning names the orphaned change by id (we print a 12-char prefix).
+    assert!(
+        r.stderr.contains("warning") && r.stderr.contains(&commit_id[..12]),
+        "expected warning naming commit {commit_id}, got:\n{}",
+        r.stderr
+    );
+
+    // jj keeps the commit: it is still visible in the log after the forget.
+    let found = jj(
+        &repo,
+        &s,
+        &["log", "--no-graph", "--ignore-working-copy", "-r", &commit_id, "-T", "commit_id"],
+    );
+    assert_eq!(found, commit_id, "orphaned commit no longer visible");
+
+    cleanup(&s);
+}
+
+#[test]
+fn jj_rm_warns_on_unsnapshotted_edits() {
+    if !jj_available() {
+        eprintln!("skipping jj_rm_warns_on_unsnapshotted_edits: jj not installed");
+        return;
+    }
+    let s = scratch();
+    let repo = mk_jj_repo(&s);
+
+    let c = run_wts(&repo, &s, &["-n", "feature-x", "-a", "cd"], &[]);
+    assert!(c.success, "jj create failed: {}", c.stderr);
+    let dest = s.join("repo-wts").join("feature-x");
+
+    // Edit a file but never run jj in the workspace: wts must snapshot before
+    // it decides whether the workspace holds unpushed work.
+    fs::write(dest.join("wip.txt"), "work\n").unwrap();
+
+    let r = run_wts(&repo, &s, &["rm", "feature-x"], &[]);
+    assert!(r.success, "jj rm failed: {}", r.stderr);
+    assert!(
+        r.stderr.contains("warning"),
+        "expected warning for unsnapshotted edits, got:\n{}",
+        r.stderr
+    );
+
+    cleanup(&s);
+}
+
+#[test]
+fn jj_rm_no_warning_for_clean_workspace() {
+    if !jj_available() {
+        eprintln!("skipping jj_rm_no_warning_for_clean_workspace: jj not installed");
+        return;
+    }
+    let s = scratch();
+    let repo = mk_jj_repo(&s);
+
+    let c = run_wts(&repo, &s, &["-n", "feature-x", "-a", "cd"], &[]);
+    assert!(c.success, "jj create failed: {}", c.stderr);
+
+    // Nothing was done in the workspace: its working-copy commit is empty and
+    // everything below it is covered by the default workspace.
+    let r = run_wts(&repo, &s, &["rm", "feature-x"], &[]);
+    assert!(r.success, "jj rm failed: {}", r.stderr);
+    assert!(
+        !r.stderr.contains("warning"),
+        "unexpected warning for a clean workspace:\n{}",
+        r.stderr
+    );
+
+    cleanup(&s);
+}
+
+#[test]
+fn jj_rm_no_warning_when_bookmarked() {
+    if !jj_available() {
+        eprintln!("skipping jj_rm_no_warning_when_bookmarked: jj not installed");
+        return;
+    }
+    let s = scratch();
+    let repo = mk_jj_repo(&s);
+
+    let c = run_wts(&repo, &s, &["-n", "feature-x", "-a", "cd"], &[]);
+    assert!(c.success, "jj create failed: {}", c.stderr);
+    let dest = s.join("repo-wts").join("feature-x");
+
+    fs::write(dest.join("wip.txt"), "work\n").unwrap();
+    jj(&dest, &s, &["status"]);
+    // A bookmark keeps the work named and discoverable, so no warning.
+    jj(&repo, &s, &["bookmark", "create", "keepme", "-r", "\"feature-x\"@"]);
+
+    let r = run_wts(&repo, &s, &["rm", "feature-x"], &[]);
+    assert!(r.success, "jj rm failed: {}", r.stderr);
+    assert!(
+        !r.stderr.contains("warning"),
+        "unexpected warning for bookmarked work:\n{}",
+        r.stderr
     );
 
     cleanup(&s);

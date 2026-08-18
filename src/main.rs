@@ -824,6 +824,72 @@ fn do_rm(backend: Backend, root: PathBuf, names: Vec<String>) {
     }
 }
 
+/// Warn when deleting `branch` would leave commits unreachable from every other
+/// ref, printing the tip commit id so the work can be recovered (`git branch
+/// <name> <sha>`) before gc prunes it. Never blocks the removal.
+///
+/// GitHub's squash and rebase merges rewrite the branch's commits, so a
+/// merged-then-auto-deleted branch still triggers this once its remote-tracking
+/// ref is pruned; wts can't tell rewritten-but-merged work from never-merged
+/// work, and prefers a spurious warning over a silent loss.
+fn warn_if_unpushed_git(main_str: &str, branch: &str) {
+    let Ok(tip) = git_capture(&[
+        "-C", main_str, "rev-parse", "--verify", "--quiet",
+        &format!("refs/heads/{branch}"),
+    ]) else {
+        return; // no branch to orphan (e.g. a detached worktree)
+    };
+    // Commits only this branch holds. `--exclude` filters just the following
+    // `--branches` and matches the short branch name; HEAD is negated
+    // explicitly because `--branches` misses a detached HEAD in the main repo.
+    let exclude = format!("--exclude={branch}");
+    let unique = git_capture(&[
+        "-C", main_str, "rev-list", "--count", &tip, "--not", "HEAD",
+        &exclude, "--branches", "--remotes", "--tags",
+    ])
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok())
+    .unwrap_or(0);
+    if unique > 0 {
+        eprintln!(
+            "wts: warning: branch '{branch}' has {unique} commit(s) not on any other branch, tag, or remote; tip was {tip}"
+        );
+        eprintln!("wts: recover with: git branch {branch} {tip}");
+    }
+}
+
+/// Warn when forgetting workspace `name` leaves non-empty commits that no
+/// bookmark, remote, or other workspace covers. Unlike git, jj keeps those
+/// commits in the repo (forget only abandons an empty, undescribed working-copy
+/// commit), so the warning just says where to find them.
+fn warn_if_unpushed_jj(main_str: &str, name: &str, dir: &Path) {
+    // Snapshot the workspace so file edits made without ever running jj there
+    // are counted; best-effort (e.g. a stale working copy skips the snapshot).
+    if dir.is_dir() {
+        let _ = Command::new("jj").arg("-R").arg(dir).arg("status").output();
+    }
+    // Non-empty mutable commits reachable only from this workspace's working
+    // copy: not from another workspace, a bookmark, or a remote.
+    let revset = format!(
+        "(::\"{name}\"@ ~ ::(working_copies() ~ \"{name}\"@) ~ ::bookmarks() ~ ::remote_bookmarks()) & ~empty() & mutable()"
+    );
+    let Ok(out) = jj_capture(&[
+        "-R", main_str, "log", "--no-graph", "--ignore-working-copy", "-r", &revset,
+        "-T",
+        "change_id.shortest(8) ++ \" \" ++ commit_id.shortest(12) ++ \" \" ++ description.first_line() ++ \"\\n\"",
+    ]) else {
+        return;
+    };
+    if out.is_empty() {
+        return;
+    }
+    eprintln!("wts: warning: workspace '{name}' has commit(s) not on any bookmark or remote:");
+    for line in out.lines() {
+        eprintln!("wts:   {line}");
+    }
+    eprintln!("wts: they stay in the repo; find them with `jj log`");
+}
+
 /// jj removal: `jj workspace forget` (via the main repo, so we can drop the one
 /// we're standing in) then delete the folder. Returns true on failure.
 fn remove_jj(
@@ -838,6 +904,7 @@ fn remove_jj(
     // Forget is keyed on the jj name; a folder with no registered workspace just
     // gets deleted below.
     if in_vcs {
+        warn_if_unpushed_jj(main_str, name, dir);
         match Command::new("jj")
             .args(["-R", main_str, "workspace", "forget", name])
             .status()
@@ -907,8 +974,10 @@ fn remove_git(
     }
 
     // Delete the branch wts created for this worktree. Silent and best-effort:
-    // it's just cleanup, and a detached-HEAD worktree has no such branch.
+    // it's just cleanup, and a detached-HEAD worktree has no such branch. The
+    // deletion is what can orphan commits, so check for unpushed work first.
     let branch = format!("{}{}", git_config_str("wts.branchPrefix", ""), name);
+    warn_if_unpushed_git(main_str, &branch);
     let _ = Command::new("git")
         .args(["-C", main_str, "branch", "-D", &branch])
         .output();
