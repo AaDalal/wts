@@ -72,11 +72,12 @@ $EDITOR $WTS_DIR &
 exec fish
 ```
 
-To open it in cmux instead:
+To open it in cmux instead (this one ships in
+[`examples/`](examples/cmux_new_workspace_action.fish)):
 
 ```fish
 #!/usr/bin/env fish
-cmux new-workspace --focus true --cwd $WTS_DIR --name "(wts) "(basename $WTS_DIR)
+cmux new-workspace --focus true --cwd $WTS_DIR --name "(wts) "(basename $WTS_DIR) && echo $WTS_DIR | pbcopy
 ```
 
 A script can't cd the shell you ran `wts` from (it's a child process); the
